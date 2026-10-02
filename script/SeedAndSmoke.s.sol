@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Script, console2} from "forge-std/Script.sol";
 import {PriceFeed} from "../src/PriceFeed.sol";
 import {NhiFeed} from "../src/NhiFeed.sol";
+import {SpotFeed} from "../src/SpotFeed.sol";
 import {CDPVault} from "../src/CDPVault.sol";
 import {CompToken} from "../src/CompToken.sol";
 import {MockIMD} from "../src/MockIMD.sol";
@@ -25,7 +26,7 @@ contract SeedAndSmoke is Script {
 
         PriceFeed priceFeed = PriceFeed(address(vault.priceFeed()));
         NhiFeed nhiFeed = NhiFeed(address(vault.nhiFeed()));
-        PriceFeed spotFeed = PriceFeed(address(vault.spotFeed()));
+        SpotFeed spotFeed = SpotFeed(address(vault.spotFeed()));
         MockIMD imd = MockIMD(address(vault.imdToken()));
         CompToken comp = vault.compToken();
 

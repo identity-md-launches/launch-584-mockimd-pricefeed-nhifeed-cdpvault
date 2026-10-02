@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Script, console2} from "forge-std/Script.sol";
 import {PriceFeed} from "../src/PriceFeed.sol";
 import {NhiFeed} from "../src/NhiFeed.sol";
+import {SpotFeed} from "../src/SpotFeed.sol";
 import {CDPVault} from "../src/CDPVault.sol";
 import {CompToken} from "../src/CompToken.sol";
 import {MockIMD} from "../src/MockIMD.sol";
@@ -86,7 +87,7 @@ contract DeployComp is Script {
             MAX_AGE,
             MAX_DEVIATION_BPS
         );
-        PriceFeed spotFeed = new PriceFeed(
+        SpotFeed spotFeed = new SpotFeed(
             ATTESTER,
             operator,
             ATTESTATION_CHAIN_ID,
@@ -130,7 +131,7 @@ contract DeployComp is Script {
         CDPVault vault,
         PriceFeed priceFeed,
         NhiFeed nhiFeed,
-        PriceFeed spotFeed,
+        SpotFeed spotFeed,
         address imd,
         address operator
     ) internal view {
@@ -151,7 +152,7 @@ contract DeployComp is Script {
         require(comp.vault() == address(vault), "comp: not bound to vault");
         require(comp.totalSupply() == 0, "comp: nonzero opening supply");
 
-        PriceFeed[3] memory feeds = [priceFeed, PriceFeed(address(nhiFeed)), spotFeed];
+        PriceFeed[3] memory feeds = [priceFeed, PriceFeed(address(nhiFeed)), PriceFeed(address(spotFeed))];
         for (uint256 i = 0; i < feeds.length; ++i) {
             require(feeds[i].attester() == ATTESTER, "feed: wrong attester");
             require(feeds[i].relayer() == operator, "feed: relayer is not the operator");
