@@ -46,6 +46,7 @@ contract IncrementHandler is Test {
     uint256 public combinedPayouts;
     uint256 public guardedRejections;
     uint256 public divergentRepayments;
+    uint256 public fullRepayments;
     uint256 public divergentExits;
     uint256 public marks;
     uint256 public feeAccrualChecks;
@@ -148,6 +149,47 @@ contract IncrementHandler is Test {
             assertLe(vault.recordedBadDebtOf(actor), recordedBefore, "a payment never grows the record");
         }
         lastFeesMinted = vault.totalFeesMinted();
+        if (diverged) ++divergentRepayments;
+    }
+
+    /// @dev The execution-time full repayment: it must succeed under every spot state, close the whole
+    /// accrued debt in one call, pay exactly the live fee, and discard any record and mark. With nothing
+    /// owed it is a ZeroAmount revert, never a silent no-op.
+    function repayAll(uint256 seed) external {
+        address actor = borrowers[seed % borrowers.length];
+        uint256 owed = vault.debtOf(actor);
+        if (owed == 0) {
+            vm.prank(actor);
+            try vault.repayAllCOMP() {
+                assertTrue(false, "repayAll with nothing owed must revert");
+            } catch (bytes memory reason) {
+                assertEq(bytes4(reason), CDPVault.ZeroAmount.selector, "nothing owed");
+            }
+            return;
+        }
+        _ensureComp(actor, owed);
+        uint256 feeBefore = vault.feeOf(actor);
+        uint256 feesMintedBefore = vault.totalFeesMinted();
+        uint256 recipientBefore = comp.balanceOf(FEE_RECIPIENT);
+        uint256 totalDebtBefore = vault.totalDebt();
+        uint256 compBefore = comp.balanceOf(actor);
+        bool diverged = _guardError() != bytes4(0);
+
+        vm.prank(actor);
+        vault.repayAllCOMP();
+
+        assertEq(compBefore - comp.balanceOf(actor), owed, "burns exactly the live debt");
+        assertEq(vault.debtOf(actor), 0, "nothing is owed afterwards");
+        assertEq(vault.feeOf(actor), 0, "no fee survives a full repayment");
+        assertEq(totalDebtBefore - vault.totalDebt(), owed - feeBefore, "principal headroom is freed in full");
+        assertEq(vault.totalFeesMinted() - feesMintedBefore, feeBefore, "exactly the live fee is minted");
+        assertEq(comp.balanceOf(FEE_RECIPIENT) - recipientBefore, feeBefore, "to the recipient");
+        assertEq(vault.recordedBadDebtOf(actor), 0, "a full payment clears any record");
+        (,, bool marked, address marker) = vault.liquidationMarks(actor);
+        assertFalse(marked, "a debt-free position carries no mark whatever the spot says");
+        assertEq(marker, address(0));
+        lastFeesMinted = vault.totalFeesMinted();
+        ++fullRepayments;
         if (diverged) ++divergentRepayments;
     }
 
@@ -508,7 +550,7 @@ abstract contract IncrementInvariantBase is StdInvariant, Test {
         vault = handler.vault();
         comp = handler.comp();
         imd = handler.imd();
-        bytes4[] memory selectors = new bytes4[](11);
+        bytes4[] memory selectors = new bytes4[](12);
         selectors[0] = handler.deposit.selector;
         selectors[1] = handler.mintDebt.selector;
         selectors[2] = handler.mintWork.selector;
@@ -520,6 +562,7 @@ abstract contract IncrementInvariantBase is StdInvariant, Test {
         selectors[8] = handler.mark.selector;
         selectors[9] = handler.clearMark.selector;
         selectors[10] = handler.liquidate.selector;
+        selectors[11] = handler.repayAll.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -679,6 +722,27 @@ abstract contract IncrementInvariantBase is StdInvariant, Test {
         assertEq(handler.incidentalClears(), 1, "an agreeing spot lets the recovery clear the mark");
         (,, bool marked,) = vault.liquidationMarks(handler.borrowers(0));
         assertFalse(marked);
+        afterInvariant();
+    }
+
+    function test_handlerSequenceClosesARecordedShortfallWithAFullRepaymentWhileDiverged() public {
+        handler.setMarket(2, 2);
+        handler.mintDebt(0, 100 ether); // 200 COMP against 300 IMD
+        handler.deposit(0, 30 ether); // 330 IMD
+        handler.advanceTime(1 days); // a fee accrues on the way down when the rate is nonzero
+        handler.setMarket(0, 0); // price 0.5: 150 COMP repaid seizes exactly 330 IMD
+        handler.mark(1, 0);
+        handler.liquidate(0, 0, 150 ether, false);
+        assertEq(handler.exhaustingLiquidations(), 1);
+        assertGt(vault.totalBadDebt(), 0, "the remainder is recorded");
+        handler.advanceTime(1 days);
+        handler.setSpot(7); // ten times the primary
+        handler.repayAll(0);
+        assertEq(handler.fullRepayments(), 1, "the full repayment landed while diverged");
+        assertEq(handler.divergentRepayments(), 1);
+        assertEq(vault.totalBadDebt(), 0, "the record went with the debt");
+        handler.repayAll(0); // nothing owed: the ZeroAmount branch
+        assertEq(handler.fullRepayments(), 1);
         afterInvariant();
     }
 

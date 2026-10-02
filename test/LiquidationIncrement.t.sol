@@ -600,6 +600,91 @@ contract LiquidationIncrementTest is Test {
         _expectMintRevert(ALICE, 1, CDPVault.InvalidPrice.selector);
     }
 
+    /// @dev The bound is one number shared by every price-dependent entry point. For random primary
+    /// prices and words, mint, mark, liquidate, clearRecoveredMark and a debt-bearing withdrawal all
+    /// accept a spot exactly at the bound and all refuse one wei beyond it, while repayment, deposit
+    /// and work minting proceed regardless.
+    /// forge-config: default.fuzz.runs = 500
+    function testFuzz_everyGuardedEntryPointSharesTheInclusiveBound(uint256 price, uint256 bps) public {
+        price = bound(price, 4e12, 1e24);
+        bps = bound(bps, 0, 10_000);
+        _price(price);
+        _deploy(bps, 1000, 0, 0);
+        uint256 debt = Math.mulDiv(1e24, price, 4e18); // CR 400 against 1e24 IMD at the opening price
+        _open(ALICE, 1e24, debt);
+        _open(BOB, 1e25, debt); // CR 4000
+        _work(CAROL, debt);
+        nhi.setValue(0.6 ether); // minCR 200, zero grace
+        uint256 primaryPrice = price / 4;
+        _price(primaryPrice); // ALICE at CR 100 is underwater; BOB at CR 1000 stays healthy
+        uint256 tolerance = Math.mulDiv(primaryPrice, bps, 10_000);
+
+        _assertGuardedActionsAccept(primaryPrice + tolerance);
+        _assertGuardedActionsRefuse(primaryPrice + tolerance + 1);
+        if (primaryPrice > tolerance) {
+            _assertGuardedActionsAccept(primaryPrice - tolerance);
+            if (primaryPrice - tolerance > 1) _assertGuardedActionsRefuse(primaryPrice - tolerance - 1);
+        }
+    }
+
+    function _assertGuardedActionsAccept(uint256 spotPrice) internal {
+        spot.setValue(spotPrice);
+        _mark(KEEPER, ALICE);
+        (,, bool marked,) = vault.liquidationMarks(ALICE);
+        assertTrue(marked, "mark accepted at the bound");
+        uint256 owed = vault.debtOf(ALICE);
+        vm.prank(CAROL);
+        vault.liquidate(ALICE, 1);
+        assertEq(vault.debtOf(ALICE), owed - 1, "liquidation accepted at the bound");
+        (uint256 collateral, uint256 debt) = vault.positions(BOB);
+        vm.prank(BOB);
+        vault.mintCOMP(1);
+        vm.prank(BOB);
+        vault.withdrawCollateral(1);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(BOB);
+        (uint256 collateralAfter, uint256 debtAfter) = vault.positions(BOB);
+        assertEq(debtAfter, debt + 1, "mint accepted at the bound");
+        assertEq(collateralAfter, collateral - 1, "debt-bearing withdrawal accepted at the bound");
+    }
+
+    function _assertGuardedActionsRefuse(uint256 spotPrice) internal {
+        spot.setValue(spotPrice);
+        (uint256 aliceCollateral, uint256 aliceDebt) = vault.positions(ALICE);
+        (uint256 bobCollateral, uint256 bobDebt) = vault.positions(BOB);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        _mark(KEEPER, ALICE);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(CAROL);
+        vault.liquidate(ALICE, 1);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(BOB);
+        vault.mintCOMP(1);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(BOB);
+        vault.withdrawCollateral(1);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(BOB);
+        (uint256 collateral, uint256 debt) = vault.positions(ALICE);
+        assertEq(collateral, aliceCollateral, "refused liquidation seizes nothing");
+        assertEq(debt, aliceDebt, "refused liquidation repays nothing");
+        (collateral, debt) = vault.positions(BOB);
+        assertEq(collateral, bobCollateral, "refused withdrawal releases nothing");
+        assertEq(debt, bobDebt, "refused mint issues nothing");
+
+        // The borrower's way out and the price-independent channels never consult the spot.
+        vm.prank(ALICE);
+        vault.repayCOMP(1);
+        vm.prank(BOB);
+        vault.depositCollateral(1);
+        _work(CAROL, 1);
+        (collateral, debt) = vault.positions(ALICE);
+        assertEq(debt, aliceDebt - 1, "repayment proceeds beyond the bound");
+        (collateral,) = vault.positions(BOB);
+        assertEq(collateral, bobCollateral + 1, "deposit proceeds beyond the bound");
+    }
+
     function test_constructorBoundsEveryWordAndValidatesTheSpotFeed() public {
         address p = address(primary);
         address n = address(nhi);
@@ -714,6 +799,59 @@ contract LiquidationIncrementTest is Test {
         assertEq(_transfersTo(logs, KEEPER), 1, "one transfer for marker plus liquidator");
         assertEq(imd.balanceOf(KEEPER) - before, 10.8 ether, "seized minus the protocol cut");
         assertEq(imd.balanceOf(FEE_RECIPIENT) - protocolBefore, 0.2 ether);
+    }
+
+    /// @dev The three roles are addresses, not slots: when the protocol recipient is also the marker
+    /// or the liquidator it must receive exactly the sum of the shares it plays, and the sum of all
+    /// three deltas must still be exactly the seized amount. A share paid twice or dropped when two
+    /// roles coincide would show up here and nowhere else.
+    function test_sharesConserveSeizedWhenTheRecipientIsAlsoMarkerOrLiquidator() public {
+        // The recipient liquidates a position a separate keeper marked: liquidator remainder plus protocol cut.
+        _deploy(500, 1000, 0, 2000);
+        _fund(FEE_RECIPIENT);
+        _open(ALICE, 150 ether, 100 ether);
+        _work(FEE_RECIPIENT, 100 ether);
+        nhi.setValue(0.6 ether);
+        _mark(KEEPER, ALICE);
+        uint256 recipientBefore = imd.balanceOf(FEE_RECIPIENT);
+        uint256 keeperBefore = imd.balanceOf(KEEPER);
+        vm.prank(FEE_RECIPIENT);
+        vault.liquidate(ALICE, 10 ether);
+        assertEq(imd.balanceOf(KEEPER) - keeperBefore, 0.1 ether, "the separate marker keeps its share");
+        assertEq(imd.balanceOf(FEE_RECIPIENT) - recipientBefore, 10.9 ether, "liquidator 10.7 plus protocol 0.2");
+
+        // The recipient marks and a separate liquidator liquidates: marker cut plus protocol cut.
+        nhi.setValue(0.85 ether);
+        _deploy(500, 1000, 0, 2000);
+        _fund(FEE_RECIPIENT);
+        _open(ALICE, 150 ether, 100 ether);
+        _work(BOB, 100 ether);
+        nhi.setValue(0.6 ether);
+        _mark(FEE_RECIPIENT, ALICE);
+        recipientBefore = imd.balanceOf(FEE_RECIPIENT);
+        uint256 bobBefore = imd.balanceOf(BOB);
+        vm.prank(BOB);
+        vault.liquidate(ALICE, 10 ether);
+        assertEq(imd.balanceOf(BOB) - bobBefore, 10.7 ether, "the liquidator is unaffected by who marked");
+        assertEq(imd.balanceOf(FEE_RECIPIENT) - recipientBefore, 0.3 ether, "marker 0.1 plus protocol 0.2");
+
+        // The recipient plays all three roles: the combined transfer plus the protocol cut equals seized.
+        nhi.setValue(0.85 ether);
+        _deploy(500, 1000, 0, 2000);
+        _fund(FEE_RECIPIENT);
+        _open(ALICE, 150 ether, 100 ether);
+        _work(FEE_RECIPIENT, 100 ether);
+        nhi.setValue(0.6 ether);
+        _mark(FEE_RECIPIENT, ALICE);
+        recipientBefore = imd.balanceOf(FEE_RECIPIENT);
+        uint256 vaultBefore = imd.balanceOf(address(vault));
+        vm.prank(FEE_RECIPIENT);
+        vault.liquidate(ALICE, 10 ether);
+        assertEq(imd.balanceOf(FEE_RECIPIENT) - recipientBefore, 11 ether, "every share lands on the one address");
+        assertEq(vaultBefore - imd.balanceOf(address(vault)), 11 ether, "and nothing more than seized leaves");
+        (uint256 collateral, uint256 debt) = vault.positions(ALICE);
+        assertEq(collateral, 139 ether, "the borrower loses exactly seized in every configuration");
+        assertEq(debt, 90 ether);
     }
 
     function test_borrowerLossIsIdenticalWithAndWithoutShares() public {
@@ -942,6 +1080,61 @@ contract LiquidationIncrementTest is Test {
         assertApproxEqAbs(expectedFee, linear, principal / 1e18 + 1, "linear rate up to index quantisation");
     }
 
+    /// @dev 365 days * 10_000 = 2^11 * 3^3 * 5^7 * 73 and the 1e18 scale supplies every factor except
+    /// 3^3 * 73 = 1971. Elapsed times that are multiples of 1971 seconds therefore produce an exact
+    /// index delta, and the accrued fee must equal the pure linear formula floor(P * t * r / Y) to the
+    /// wei, for any rate, principal and borrowing delay.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_accrualIsExactlyLinearWhenTheIndexDividesEvenly(
+        uint256 rate,
+        uint256 principal,
+        uint256 delay,
+        uint256 steps
+    ) public {
+        rate = bound(rate, 1, 10_000);
+        principal = bound(principal, 1, 1e24);
+        delay = bound(delay, 0, 3 * 365 days);
+        steps = bound(steps, 0, 160_000); // up to about ten years
+        uint256 elapsed = steps * 1971;
+        _deploy(500, 0, rate, 0);
+        vm.warp(block.timestamp + delay);
+        _open(ALICE, 1e26, principal);
+        vm.warp(block.timestamp + elapsed);
+
+        uint256 expected = principal * elapsed * rate / (365 days * 10_000);
+        assertEq(vault.feeOf(ALICE), expected, "fee equals the linear rate exactly");
+        assertEq(vault.debtOf(ALICE), principal + expected);
+        assertEq(vault.totalDebt(), principal, "principal is untouched by accrual");
+        assertEq(comp.totalSupply(), principal, "accrual mints nothing");
+    }
+
+    /// @dev Every checkpoint carries its sub-wei remainder forward, so an account that is touched
+    /// repeatedly at irregular intervals owes exactly what an untouched twin owes: fee-only payments
+    /// leave the principal alone and the two accrual paths agree to the wei after two years.
+    function test_feeCheckpointsCarryFractionsSoTouchedAndUntouchedTwinsOweTheSame() public {
+        _deploy(500, 0, 1000, 0);
+        uint256 principal = 123_456_789_012_345_678_901; // about 123.46 COMP, nothing divides cleanly
+        _open(ALICE, 1e24, principal);
+        _open(BOB, 1e24, principal);
+        _work(ALICE, 1 ether);
+        uint256 paid;
+        for (uint256 i = 1; i <= 24; ++i) {
+            vm.warp(block.timestamp + 20 days + i * 1234);
+            assertGt(vault.feeOf(ALICE), 0, "an interval of three weeks accrues more than a wei");
+            vm.prank(ALICE);
+            vault.repayCOMP(1); // a fee-only payment that checkpoints the account
+            ++paid;
+            assertEq(vault.totalDebt(), 2 * principal, "fee-only payments leave both principals alone");
+            assertEq(vault.debtIndexOf(ALICE), vault.debtIndex(), "the account is checkpointed now");
+        }
+        assertEq(vault.debtIndexOf(BOB), 1e18, "the twin was never checkpointed");
+        assertEq(vault.feeOf(ALICE) + paid, vault.feeOf(BOB), "no fraction is lost across 24 checkpoints");
+        assertEq(vault.debtOf(ALICE) + paid, vault.debtOf(BOB));
+        assertEq(vault.totalFeesMinted(), paid);
+        assertEq(comp.balanceOf(FEE_RECIPIENT), paid);
+        _assertPrincipalSupply();
+    }
+
     function test_lateBorrowerOwesOnlyItsOwnElapsedTime() public {
         _deploy(500, 0, 1000, 0);
         _open(ALICE, 1000 ether, 100 ether);
@@ -1099,6 +1292,51 @@ contract LiquidationIncrementTest is Test {
         assertEq(vault.totalBadDebt(), 50 ether);
         assertEq(vault.recordedBadDebtOf(ALICE), 50 ether);
         assertEq(vault.badDebtOf(ALICE), 50 ether, "with no collateral the whole debt is uncovered");
+        _assertPrincipalSupply();
+    }
+
+    /// @dev At a primary of 0.25 a repayment of 5k COMP seizes exactly 22k wei of IMD, so a position
+    /// holding 22k wei against 5k plus a random shortfall is exhausted by one liquidation. With another
+    /// account's record already in the accumulator, the delta must be the shortfall to the wei, and it
+    /// must equal what badDebtOf predicted before the liquidation.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_exhaustingLiquidationMovesTheAccumulatorByExactlyThePredictedShortfall(
+        uint256 k,
+        uint256 shortfall
+    ) public {
+        k = bound(k, 1e17, 2e19);
+        shortfall = bound(shortfall, 1, 1e20);
+        uint256 repayable = 5 * k;
+        uint256 collateral = 22 * k;
+        uint256 debt = repayable + shortfall;
+
+        // CAROL seeds the accumulator so the delta, not the absolute value, is what the test measures.
+        _open(CAROL, 220 ether, 100 ether);
+        _work(BOB, 100 ether + debt);
+        _price(Math.mulDiv(2e18, debt, collateral) + 1); // ALICE opens healthy at this price
+        _open(ALICE, collateral, debt);
+        _price(0.25 ether);
+        nhi.setValue(0.6 ether);
+        _mark(KEEPER, CAROL);
+        vm.prank(BOB);
+        vault.liquidate(CAROL, 50 ether);
+        assertEq(vault.totalBadDebt(), 50 ether, "seeded accumulator");
+
+        assertEq(vault.badDebtOf(ALICE), shortfall, "the view predicts the shortfall");
+        _mark(KEEPER, ALICE);
+        uint256 before = vault.totalBadDebt();
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit CDPVault.BadDebtRecorded(ALICE, shortfall);
+        vm.prank(BOB);
+        vault.liquidate(ALICE, repayable);
+
+        (uint256 collateralLeft, uint256 debtLeft) = vault.positions(ALICE);
+        assertEq(collateralLeft, 0, "exactly exhausted");
+        assertEq(debtLeft, shortfall);
+        assertEq(vault.totalBadDebt() - before, shortfall, "the accumulator moves by exactly the shortfall");
+        assertEq(vault.recordedBadDebtOf(ALICE), shortfall);
+        assertEq(vault.badDebtOf(ALICE), shortfall, "the view and the record agree once nothing is left");
+        assertEq(vault.totalBadDebt(), vault.recordedBadDebtOf(ALICE) + vault.recordedBadDebtOf(CAROL));
         _assertPrincipalSupply();
     }
 
