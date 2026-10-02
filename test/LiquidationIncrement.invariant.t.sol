@@ -49,6 +49,8 @@ contract IncrementHandler is Test {
     uint256 public divergentExits;
     uint256 public marks;
     uint256 public feeAccrualChecks;
+    uint256 public incidentalClears;
+    uint256 public disputedClearsRefused;
 
     constructor(uint256 rate_) {
         rate = rate_;
@@ -87,11 +89,15 @@ contract IncrementHandler is Test {
     // Borrower actions
     // ------------------------------------------------------------------------------------------------
 
+    /// @dev A deposit must succeed under every spot state; what the spot decides is only whether the
+    /// recovery it causes may discard a live mark.
     function deposit(uint256 seed, uint256 amount) external {
         address actor = borrowers[seed % borrowers.length];
         amount = bound(amount, 1, 1000 ether);
+        MarkBefore memory before = _markBefore(actor);
         vm.prank(actor);
         vault.depositCollateral(amount);
+        _checkIncidentalClear(actor, before);
     }
 
     function mintDebt(uint256 seed, uint256 amount) external {
@@ -127,10 +133,12 @@ contract IncrementHandler is Test {
         uint256 recipientBefore = comp.balanceOf(FEE_RECIPIENT);
         uint256 recordedBefore = vault.recordedBadDebtOf(actor);
         bool diverged = _guardError() != bytes4(0);
+        MarkBefore memory before = _markBefore(actor);
 
         vm.prank(actor);
         vault.repayCOMP(amount);
 
+        _checkIncidentalClear(actor, before);
         uint256 feePaid = Math.min(amount, feeBefore);
         assertEq(vault.debtOf(actor), owed - amount, "repayment reduces accrued debt one for one");
         assertEq(vault.feeOf(actor), feeBefore - feePaid, "fees are paid first");
@@ -396,6 +404,41 @@ contract IncrementHandler is Test {
     // Helpers
     // ------------------------------------------------------------------------------------------------
 
+    struct MarkBefore {
+        uint256 at;
+        uint256 grace;
+        bool marked;
+        address marker;
+    }
+
+    function _markBefore(address owner) private view returns (MarkBefore memory m) {
+        (m.at, m.grace, m.marked, m.marker) = vault.liquidationMarks(owner);
+    }
+
+    /// @dev Mirrors _clearIfRecovered after a deposit or repayment: a debt-free position clears its mark
+    /// unconditionally; a debt-bearing one clears only when the spot agrees with the primary and the
+    /// position is healthy at the primary; a disputed spot leaves the whole mark untouched.
+    function _checkIncidentalClear(address owner, MarkBefore memory before) private {
+        (uint256 at, uint256 grace, bool marked, address marker) = vault.liquidationMarks(owner);
+        if (!before.marked) {
+            assertFalse(marked, "deposit and repayment never create a mark");
+            return;
+        }
+        bool healthyAtPrimary = vault.debtOf(owner) == 0 || vault.collateralRatio(owner) >= vault.minCR();
+        bool shouldClear = vault.debtOf(owner) == 0 || (_guardError() == bytes4(0) && healthyAtPrimary);
+        if (shouldClear) {
+            assertFalse(marked, "recovery with an agreeing spot clears the mark");
+            assertEq(marker, address(0), "a cleared mark forgets its keeper");
+            ++incidentalClears;
+        } else {
+            assertTrue(marked, "a disputed or still-underwater mark survives");
+            assertEq(at, before.at, "kept mark keeps its timestamp");
+            assertEq(grace, before.grace, "kept mark keeps its grace snapshot");
+            assertEq(marker, before.marker, "kept mark keeps its marker");
+            if (healthyAtPrimary) ++disputedClearsRefused;
+        }
+    }
+
     /// @dev Mirrors _requirePriceAgreement: the error every price-dependent entry point (mint, mark,
     /// liquidate, clear and a debt-bearing withdrawal) must surface before any other check.
     function _guardError() private view returns (bytes4) {
@@ -613,6 +656,29 @@ abstract contract IncrementInvariantBase is StdInvariant, Test {
         handler.repay(0, 1 ether);
         assertEq(handler.divergentRepayments(), 1, "repayment while diverged");
         handler.setSpot(0);
+        afterInvariant();
+    }
+
+    function test_handlerSequenceRefusesADisputedIncidentalClearAndThenClears() public {
+        handler.setMarket(2, 2); // price 1, NHI .85: 300 IMD against 100 COMP, CR 300
+        handler.setMarket(0, 0); // price 0.5, NHI .60: CR 150 against a 200 floor
+        handler.mark(0, 0);
+        assertEq(handler.marks(), 1);
+        // The pushed primary that the finding used: healthy at 1 while the spot still says 0.5.
+        handler.primary().setValue(1 ether);
+        handler.deposit(0, 1);
+        assertEq(handler.disputedClearsRefused(), 1, "a one-wei deposit cannot discard the mark");
+        handler.repay(0, 1);
+        assertEq(handler.disputedClearsRefused(), 2, "nor can a one-wei repayment");
+        handler.setSpot(5); // stale spot with a genuine recovery at the primary
+        handler.deposit(0, 1);
+        assertEq(handler.disputedClearsRefused(), 3);
+        assertEq(handler.incidentalClears(), 0);
+        handler.setSpot(1); // exactly at the bound
+        handler.deposit(0, 1);
+        assertEq(handler.incidentalClears(), 1, "an agreeing spot lets the recovery clear the mark");
+        (,, bool marked,) = vault.liquidationMarks(handler.borrowers(0));
+        assertFalse(marked);
         afterInvariant();
     }
 

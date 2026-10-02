@@ -345,6 +345,142 @@ contract LiquidationIncrementTest is Test {
         assertEq(marker, address(0));
     }
 
+    function test_depositAgainstADisputedPrimaryKeepsTheMarkAndItsMarker() public {
+        _open(ALICE, 150 ether, 100 ether);
+        _price(0.9 ether); // CR 135 < 150: underwater at an honest price
+        _mark(KEEPER, ALICE);
+        (uint256 markedAt, uint256 grace,, address marker) = vault.liquidationMarks(ALICE);
+        uint256 tolerance = Math.mulDiv(0.9 ether, vault.maxDivergenceBps(), 10_000);
+
+        // The finding this guards against: a pushed primary says CR 150 and a one-wei deposit would have
+        // discarded the live mark. The deposit lands; the mark, its grace snapshot and its marker do not move.
+        primary.setValue(1 ether);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        (uint256 collateral,) = vault.positions(ALICE);
+        assertEq(collateral, 150 ether + 1, "the deposit itself succeeds");
+        _assertMarkUnchanged(markedAt, grace, marker, "pushed primary");
+        primary.setValue(0.9 ether);
+
+        // A genuine recovery at the primary is still not cleared while the spot is stale or zero.
+        spot.setStale(true);
+        vm.prank(ALICE);
+        vault.depositCollateral(100 ether); // 250 IMD at 0.9 against 100 COMP: CR 225
+        assertGe(vault.collateralRatio(ALICE), vault.minCR(), "healthy at the primary");
+        _assertMarkUnchanged(markedAt, grace, marker, "stale spot");
+        spot.setStale(false);
+        spot.setValue(0);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        _assertMarkUnchanged(markedAt, grace, marker, "zero spot");
+
+        // One wei beyond the bound keeps it; exactly at the bound the same deposit clears it.
+        spot.setValue(0.9 ether + tolerance + 1);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        _assertMarkUnchanged(markedAt, grace, marker, "one wei beyond");
+        spot.setValue(0.9 ether - tolerance - 1);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        _assertMarkUnchanged(markedAt, grace, marker, "one wei beyond, below");
+        spot.setValue(0.9 ether + tolerance);
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit CDPVault.UnderwaterMarkCleared(ALICE);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        (,, bool marked, address cleared) = vault.liquidationMarks(ALICE);
+        assertFalse(marked, "an agreeing spot lets the recovery clear the mark");
+        assertEq(cleared, address(0));
+    }
+
+    function test_repaymentAgainstADisputedPrimaryKeepsADebtBearingMarkAndADebtFreeOneClears() public {
+        _open(ALICE, 150 ether, 100 ether);
+        _price(0.9 ether);
+        _mark(KEEPER, ALICE);
+        (uint256 markedAt, uint256 grace,, address marker) = vault.liquidationMarks(ALICE);
+        uint256 tolerance = Math.mulDiv(0.9 ether, vault.maxDivergenceBps(), 10_000);
+
+        // Repayment is never gated, but a stale spot stops the recovery it causes from discarding the mark.
+        spot.setStale(true);
+        vm.prank(ALICE);
+        vault.repayCOMP(50 ether); // 150 IMD at 0.9 against 50 COMP: CR 270
+        assertEq(vault.debtOf(ALICE), 50 ether, "the repayment itself succeeds");
+        assertGe(vault.collateralRatio(ALICE), vault.minCR(), "healthy at the primary");
+        _assertMarkUnchanged(markedAt, grace, marker, "stale spot");
+        spot.setStale(false);
+        spot.setValue(0);
+        vm.prank(ALICE);
+        vault.repayCOMP(1);
+        _assertMarkUnchanged(markedAt, grace, marker, "zero spot");
+        primary.setValue(1 ether);
+        vm.prank(ALICE);
+        vault.repayCOMP(1);
+        _assertMarkUnchanged(markedAt, grace, marker, "pushed primary");
+        primary.setValue(0.9 ether);
+        spot.setValue(0.9 ether - tolerance - 1);
+        vm.prank(ALICE);
+        vault.repayCOMP(1);
+        _assertMarkUnchanged(markedAt, grace, marker, "one wei beyond");
+        spot.setValue(0.9 ether - tolerance);
+        vm.prank(ALICE);
+        vault.repayCOMP(1);
+        (,, bool marked,) = vault.liquidationMarks(ALICE);
+        assertFalse(marked, "exactly at the bound the repayment clears the mark");
+        assertEq(vault.debtOf(ALICE), 50 ether - 4);
+
+        // A repayment that closes the debt clears the mark whatever the spot says: nothing is left to liquidate.
+        _price(0.3 ether); // 150 IMD at 0.3 against ~50 COMP: CR 90 < 150
+        _mark(CAROL, ALICE);
+        (,, marked, marker) = vault.liquidationMarks(ALICE);
+        assertTrue(marked);
+        assertEq(marker, CAROL);
+        spot.setStale(true);
+        uint256 owed = vault.debtOf(ALICE);
+        vm.prank(ALICE);
+        vault.repayCOMP(owed);
+        (,, marked, marker) = vault.liquidationMarks(ALICE);
+        assertFalse(marked, "debt-free positions clear unconditionally");
+        assertEq(marker, address(0));
+        assertEq(vault.debtOf(ALICE), 0);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_incidentalClearUsesTheSameInclusiveBoundAsTheGuard(uint256 price, uint256 bps) public {
+        price = bound(price, 4, 1e30);
+        bps = bound(bps, 0, 10_000);
+        _deploy(bps, 0, 0, 0);
+        _price(price);
+        _open(ALICE, 1e26, Math.mulDiv(1e26, price, 4e18)); // CR about 400 at the opening price
+        nhi.setValue(0.6 ether); // minCR 200
+        _price(price / 4); // CR about 100: underwater
+        _mark(KEEPER, ALICE);
+        (uint256 markedAt, uint256 grace,, address marker) = vault.liquidationMarks(ALICE);
+        uint256 primaryPrice = price / 4;
+        uint256 tolerance = Math.mulDiv(primaryPrice, bps, 10_000);
+
+        // Recover at the primary with a deposit while the spot sits one wei outside the bound: kept.
+        spot.setValue(primaryPrice + tolerance + 1);
+        vm.prank(ALICE);
+        vault.depositCollateral(3e26); // CR about 400 again
+        assertGe(vault.collateralRatio(ALICE), vault.minCR(), "healthy at the primary");
+        _assertMarkUnchanged(markedAt, grace, marker, "beyond the bound");
+
+        // The same recovery with the spot exactly at the bound: cleared.
+        spot.setValue(primaryPrice + tolerance);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        (,, bool marked,) = vault.liquidationMarks(ALICE);
+        assertFalse(marked, "at the bound");
+    }
+
+    function _assertMarkUnchanged(uint256 markedAt, uint256 grace, address marker, string memory why) internal view {
+        (uint256 at, uint256 g, bool marked, address m) = vault.liquidationMarks(ALICE);
+        assertTrue(marked, string.concat("mark kept: ", why));
+        assertEq(at, markedAt, string.concat("timestamp kept: ", why));
+        assertEq(g, grace, string.concat("grace snapshot kept: ", why));
+        assertEq(m, marker, string.concat("marker kept: ", why));
+    }
+
     function test_staleOrZeroSpotBlocksGuardedActionsOnly() public {
         _open(ALICE, 300 ether, 100 ether);
         _work(BOB, 100 ether);
