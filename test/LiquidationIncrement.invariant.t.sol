@@ -52,6 +52,9 @@ contract IncrementHandler is Test {
     uint256 public feeAccrualChecks;
     uint256 public incidentalClears;
     uint256 public disputedClearsRefused;
+    // Unpaid fees at the last successful debt change. Later fees join an existing bad-debt
+    // record when that account is checkpointed, even if the payment is smaller than the accrual.
+    mapping(address => uint256) private checkpointedFees;
 
     constructor(uint256 rate_) {
         rate = rate_;
@@ -108,6 +111,7 @@ contract IncrementHandler is Test {
         vm.prank(actor);
         try vault.mintCOMP(amount) {
             assertEq(guard, bytes4(0), "mint passed a failing guard");
+            checkpointedFees[actor] = vault.feeOf(actor);
         } catch (bytes memory reason) {
             _expectGuardOr(reason, guard, CDPVault.UnsafeCollateralRatio.selector);
             if (guard != bytes4(0)) ++guardedRejections;
@@ -146,8 +150,16 @@ contract IncrementHandler is Test {
         assertEq(vault.totalFeesMinted() - feesMintedBefore, feePaid, "only the fee portion is minted");
         assertEq(comp.balanceOf(FEE_RECIPIENT) - recipientBefore, feePaid, "minted to the recipient");
         if (recordedBefore != 0) {
-            assertLe(vault.recordedBadDebtOf(actor), recordedBefore, "a payment never grows the record");
+            uint256 accruedRecord = recordedBefore + feeBefore - checkpointedFees[actor];
+            assertEq(
+                vault.recordedBadDebtOf(actor),
+                accruedRecord - Math.min(accruedRecord, amount),
+                "checkpoint new fees, then subtract the payment"
+            );
+        } else {
+            assertEq(vault.recordedBadDebtOf(actor), 0, "repayment alone cannot create a record");
         }
+        checkpointedFees[actor] = vault.feeOf(actor);
         lastFeesMinted = vault.totalFeesMinted();
         if (diverged) ++divergentRepayments;
     }
@@ -188,6 +200,7 @@ contract IncrementHandler is Test {
         (,, bool marked, address marker) = vault.liquidationMarks(actor);
         assertFalse(marked, "a debt-free position carries no mark whatever the spot says");
         assertEq(marker, address(0));
+        checkpointedFees[actor] = 0;
         lastFeesMinted = vault.totalFeesMinted();
         ++fullRepayments;
         if (diverged) ++divergentRepayments;
@@ -432,13 +445,24 @@ contract IncrementHandler is Test {
         lastFeesMinted = vault.totalFeesMinted();
         ++liquidations;
 
-        if (collateral == 0) {
+        _checkLiquidatedBadDebt(owner, collateral, debt, s);
+        checkpointedFees[owner] = vault.feeOf(owner);
+    }
+
+    function _checkLiquidatedBadDebt(address owner, uint256 collateral, uint256 debt, Snapshot memory s) private {
+        (uint256 price,) = primary.latestValue();
+        if (collateral == 0 || collateral < PAYOUT_SCALE / price) {
             assertEq(vault.recordedBadDebtOf(owner), debt, "exhausted collateral records the full remainder");
             assertEq(vault.totalBadDebt() + s.recorded, s.badDebt + debt, "accumulator moves by the record delta");
             if (debt != 0) ++exhaustingLiquidations;
         } else if (s.recorded == 0) {
-            assertEq(vault.recordedBadDebtOf(owner), 0, "collateral left: nothing new is recorded");
+            assertEq(vault.recordedBadDebtOf(owner), 0, "usable collateral left: nothing new is recorded");
             assertEq(vault.totalBadDebt(), s.badDebt, "accumulator untouched");
+        } else {
+            uint256 accruedRecord = s.recorded + s.ownerFee - checkpointedFees[owner];
+            uint256 expectedRecord = accruedRecord - Math.min(accruedRecord, s.amount);
+            assertEq(vault.recordedBadDebtOf(owner), expectedRecord, "checkpoint and pay the existing record");
+            assertEq(vault.totalBadDebt() + s.recorded, s.badDebt + expectedRecord, "record delta only");
         }
     }
 
@@ -763,6 +787,52 @@ abstract contract IncrementInvariantBase is StdInvariant, Test {
         assertEq(vault.totalBadDebt(), 50 ether, "time does not move it");
         handler.deposit(0, 1);
         assertEq(vault.totalBadDebt(), 50 ether, "a dust deposit does not move it");
+        afterInvariant();
+    }
+
+    function test_handlerPartialRepaymentCheckpointsFeesOnRecordedBadDebt() public {
+        handler.setMarket(2, 2);
+        handler.mintDebt(0, 100 ether);
+        handler.deposit(0, 30 ether);
+        handler.setMarket(0, 0);
+        handler.mark(0, 0);
+        handler.liquidate(0, 0, 150 ether, false);
+        address borrower = handler.borrowers(0);
+        assertEq(vault.recordedBadDebtOf(borrower), 50 ether);
+
+        handler.advanceTime(1971); // Exact linear-index interval, including at the zero rate.
+        uint256 accruedFee = 50 ether * 1971 * _rate() / (365 days * 10_000);
+        assertEq(vault.feeOf(borrower), accruedFee);
+        handler.setSpot(7);
+        handler.repay(0, 1);
+        assertEq(vault.recordedBadDebtOf(borrower), 50 ether + accruedFee - 1);
+        assertEq(vault.totalBadDebt(), 50 ether + accruedFee - 1);
+
+        // With no further elapsed time, the same unpaid fees must not be recorded twice.
+        handler.repay(0, 1);
+        assertEq(vault.recordedBadDebtOf(borrower), 50 ether + accruedFee - 2);
+        assertEq(vault.totalBadDebt(), 50 ether + accruedFee - 2);
+        afterInvariant();
+    }
+
+    function test_handlerRecognizesCollateralBelowTheSmallestLiquidationPayout() public {
+        handler.setMarket(2, 2);
+        handler.mintDebt(0, 100 ether);
+        handler.deposit(0, 30 ether + 1);
+        handler.setMarket(0, 0);
+        handler.mark(0, 0);
+        handler.liquidate(0, 0, 150 ether, false);
+
+        address borrower = handler.borrowers(0);
+        (uint256 collateral, uint256 debt) = vault.positions(borrower);
+        assertEq(collateral, 1, "one wei remains, but the smallest payout requires two");
+        assertEq(debt, 50 ether);
+        assertEq(vault.recordedBadDebtOf(borrower), debt);
+        assertEq(vault.totalBadDebt(), debt);
+        address liquidator = handler.liquidators(0);
+        vm.expectRevert(CDPVault.InsufficientCollateral.selector);
+        vm.prank(liquidator);
+        vault.liquidate(borrower, 1);
         afterInvariant();
     }
 }
