@@ -83,6 +83,32 @@
   },
   {
     "type": "function",
+    "name": "MIN_AGREED",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MIN_PANEL_SIZE",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint16",
+        "internalType": "uint16"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "attestationAnswerType",
     "inputs": [],
     "outputs": [
@@ -379,6 +405,21 @@
             "internalType": "bytes32"
           },
           {
+            "name": "panelSize",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "quorum",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
+            "name": "agreed",
+            "type": "uint16",
+            "internalType": "uint16"
+          },
+          {
             "name": "issuedAt",
             "type": "uint64",
             "internalType": "uint64"
@@ -524,6 +565,16 @@
   {
     "type": "error",
     "name": "MathOverflowedMulDiv",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotEnoughAgreement",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "PanelTooSmall",
     "inputs": []
   },
   {

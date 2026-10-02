@@ -1,6 +1,6 @@
 # CDPVault liquidation increment
 
-This change adds the spot divergence bound, marker reward, simple stability fee and visible bad debt to `src/CDPVault.sol`. Feed implementations, the primary-price payout formula, NHI thresholds, snapshotted grace, liquidation window, feed deviation band, and both existing deployment hooks retain their behavior. No tokens, configuration, deployment scripts or manifest are changed.
+This change adds the spot divergence bound, marker reward, simple stability fee and visible bad debt to `src/CDPVault.sol`. Feed implementations, the primary-price payout formula, NHI thresholds, snapshotted grace, liquidation window, feed deviation band, and both existing deployment hooks retain their behavior. No token implementations, configuration or manifest are changed.
 
 ## Constructor and integration
 
@@ -46,7 +46,7 @@ Combined bonus shares above 10,000 revert. The virtual protocol hook is unchange
 
 The global index is `1e18 + floor((now - deployedAt) * stabilityFeeBps * 1e18 / (365 days * 10000))`. Each debt change checkpoints its account's index. Interest is outstanding principal multiplied by the index delta, divided by `1e18`; unpaid interest never becomes interest-bearing principal. Fractional remainders survive partial repayment and additional borrowing, so repeated checkpoints cannot discard accrued fractions. Full repayment clears the remaining fraction below one token minor unit.
 
-Every position debt view and health decision includes the live fee. Deposits, reads and marking do not reset the debt checkpoint. Repayment and liquidation pay fees first, burn the full COMP payment, and mint only the paid fee portion to the unchanged `FEE_RECIPIENT`. `feeOf` exposes unpaid fees; `totalFeesMinted` records cumulative paid fees. A failed token burn rolls back all accounting.
+Every position debt view and health decision includes the live fee. Deposits, reads and marking do not reset the debt checkpoint. Repayment and liquidation pay fees first, burn the full COMP payment, and mint only the paid fee portion to the unchanged `FEE_RECIPIENT`. `feeOf` exposes unpaid fees; `totalFeesMinted` records cumulative paid fees. A failed token burn rolls back all accounting. `repayAllCOMP()` computes and burns the entire debt in the executing block, so a prior quote becoming stale does not leave residual debt. The caller must hold enough COMP for that live amount. It shares the same accounting, events and feed-independent exit path as `repayCOMP(amount)`, whose `ZeroAmount` and `ExcessRepayment` guards remain unchanged.
 
 The original ceiling remains a limit on issued principal: `totalDebt` is the sum of borrowed principal, and only principal repayment frees headroom. Accrued interest may make the total owed exceed that issuance ceiling. This avoids silently changing the existing ceiling hook or admitting new principal because an interest payment was mistaken for principal repayment.
 
@@ -58,7 +58,7 @@ The workflow's requested additive supply formula does not hold for unminted inte
 
 The original `InsufficientCollateral` guard remains. A caller must choose a repayment whose full payout fits; the contract does not clamp a requested repayment, seize extra collateral dust, forgive a remainder, or add insurance.
 
-`totalBadDebt` sums recognized outstanding records, not every account's live price shortfall. When liquidation exhausts collateral, the remaining accrued debt becomes `recordedBadDebtOf(account)`. While that record is nonzero, debt-changing calls add subsequent accrued fees and subtract actual payments. A collateral deposit or price recovery does not erase the record. If the account recapitalizes and borrows again, new principal is not automatically recognized, but subsequent fees still join its outstanding record until it is paid. This is deliberately conservative historical recognition; `badDebtOf` separately shows current coverage. Passage of time alone does not update the accumulator.
+`totalBadDebt` sums recognized outstanding records, not every account's live price shortfall. When liquidation leaves zero collateral or less than `floor(1.1e18 / price)` minor units of collateral, the remaining accrued debt becomes `recordedBadDebtOf(account)`. While that record is nonzero, debt-changing calls add subsequent accrued fees and subtract actual payments. A collateral deposit or price recovery does not erase the record. If the account recapitalizes and borrows again, new principal is not automatically recognized, but subsequent fees still join its outstanding record until it is paid. This is deliberately conservative historical recognition; `badDebtOf` separately shows current coverage. Passage of time alone does not update the accumulator. Unseizable dust stays in the position and can be withdrawn after repayment. The threshold uses floor rounding, matching the actual payout: at price `0.25e18`, 2 wei are unseizable but 4 wei can still cover one more wei of debt, so that boundary must not be checkpointed early.
 
 ## Checks and review
 
@@ -70,16 +70,32 @@ FOUNDRY_OUT=test/scratch/increment-out FOUNDRY_CACHE_PATH=test/scratch/increment
 forge test --offline
 ```
 
-Run the inherited suite with adapted constructor and mark outputs:
+Run the whole tree, including the migrated constructor/mark call sites and the revision regressions:
 
 ```sh
-python3 docs/tests/run-vault-checks.py --offline
+forge build
+forge test
 ```
 
-Observed results: 32 focused tests and 199 inherited tests passed. Focused coverage includes both divergence directions and exact bounds; stale/zero spot; the incidental mark clear on deposit and repayment refusing a disputed primary; repayment and exit liveness; marker replacement and combined transfers; payout conservation; late borrowing, simple interest, fractional carry, partial/full repayments and failure rollback; accrued-debt health and liquidation; ceiling behavior; executable shortfall rounding; and supply conservation fuzzing with 256 runs. Inherited checks cover the existing grace, deviation, ceiling and protocol-share behavior, token properties, runtime/opcode limits, fuzzing and invariant campaigns.
+The focused suite passes all 32 tests. The inherited offline baseline passes 185 tests, with the live-fork InHouse suite skipped. The seven revision regressions in `test/CDPVaultRevision.t.sol` additionally cover unseizable dust, the floor payout boundary, random payout prices and residues (256 runs), subsequent fee checkpoints, repayment rollback and execution-time full repayment. Focused coverage includes both divergence directions and exact bounds; stale/zero spot; the incidental mark clear on deposit and repayment refusing a disputed primary; repayment and exit liveness; marker replacement and combined transfers; payout conservation; late borrowing, simple interest, fractional carry, partial/full repayments and failure rollback; accrued-debt health and liquidation; ceiling behavior; executable shortfall rounding; and supply conservation fuzzing with 256 runs. Inherited checks cover the existing grace, deviation, ceiling and protocol-share behavior, token properties, runtime/opcode limits, fuzzing and invariant campaigns.
 
-The unmodified InHouse fixture fails locally because it names a live Sepolia collateral address. The runner installs the existing MockIMD runtime at that address using a test cheatcode; its 14 checks then pass. Those results are local checks, not claims about live Sepolia state. No network dependency was added.
+Final revision verification: `forge build` succeeds; `forge test` passes 198 tests with one fork-only suite skipped, including the six scratch proof/advisory reproductions. The separately run focused suite passes all 32 tests. Every committed ABI export matches the compiled artifact.
+
+The InHouse fixture skips offline when its live Sepolia collateral address has no code. No live-fork validation is claimed by these checks. No network dependency was added.
 
 A separate review of the changed vault identified a concrete sequence where a dust deposit could stop recognized bad-debt fees from being checkpointed, then fee-first repayment could clear the record prematurely. The implementation now accrues into an outstanding record regardless of collateral, and the focused suite reproduces the sequence. The reviewer also compared the shortfall arithmetic with exact payout capacity over 200,000 randomized uint256 cases and found no mismatch. This review is not the independently assigned source-and-manifest launch review.
 
-Existing deployment concerns remain outside this change: `FEE_RECIPIENT` is the same address as the approved reporter/relayer in the supplied configuration, so enabling revenue retains that incentive conflict. The approved stability rate remains zero, and the protocol bonus hook still defaults to zero. Legacy feed-attestation prose elsewhere in the repository may predate the current feed implementation; no feed logic or unrelated documentation was revised. Services remain responsible for the source/manifest linkage, attestation, admission and deployment.
+Existing deployment concerns remain outside this change: `FEE_RECIPIENT` is the same address as the approved reporter/relayer in the supplied configuration, so enabling revenue retains that incentive conflict. The approved stability rate remains zero, and the protocol bonus hook still defaults to zero. The v2 feed exports and [ABI guide](ABI.md) now match the fifteen-field attestation and domain version 2. No feed logic changed. The stale relayer in `oracle/` and incomplete exporter in `tools/` remain outside the permitted paths; the ABI guide identifies the required relay changes and provides a check of every export. Services remain responsible for the source/manifest linkage, attestation, admission and deployment.
+
+
+## Revision decisions and remaining deployment findings
+
+The supplied dust proof failed before the change with `recordedBadDebtOf == 0` against 50 COMP of unpayable liquidation debt; it passes after the checkpoint fix. At price `0.25e18`, the suggested ceiling-rounded threshold would also recognize a 4-wei collateral balance despite a one-wei repayment still fitting. The implementation and regression test use the payout's floor instead. Collateral and debt remain in place; only an actual payment reduces debt.
+
+The constructor still permits the primary address as spot for the documented compatibility configuration. A local reproduction confirms that comparison cannot detect disagreement. The approved deployment requires a separate spot contract, and `DeployComp.verify` enforces it. The constructor-only factory path needs the same distinct references in its independently reviewed manifest. This is a deployment finding, not an assertion that reusing the primary provides protection; changing the accepted compatibility behavior is outside this revision's necessary fixes.
+
+The equality `FEE_RECIPIENT == APPROVED_OPERATOR` also reproduces, and a nonzero-rate test pays that account. The approved rate and default protocol share remain zero. Before enabling either revenue path, an independently authorized configuration change must select a beneficiary outside the feed reporter/relayer roles. No alternative beneficiary was specified, and this assignment prohibits configuration changes.
+
+The shared quorum-one reporter can move primary, spot and NHI together and liquidate in the same block. The exact proposed NHI jump from 0.9 to 0.6 fails the existing 20% band; two accepted updates, 0.9 to 0.72 to 0.6, reproduce the claimed trust exposure. Feed logic, the deviation band, NHI policy and reporter authority are intentionally unchanged.
+
+The paid-fee supply example also reproduces: after 100 COMP borrowed, 10 work-minted, and a 110 COMP repayment, supply is 10, principal debt is zero, cumulative work minting is 10 and cumulative fee revenue is 10. The valid supply identity remains `totalSupply == totalDebt + totalWorkMinted`; adding cumulative paid fees again double counts. No accounting change is justified by that advisory.

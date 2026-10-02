@@ -18,6 +18,7 @@ The JSON files in `docs/abi/` contain complete Solidity ABI arrays, including co
 | ISwarmFeed, SwarmFeed, PriceFeed, NhiFeed | `latestValue()`, `isStale()`, `maxAge()` | Latest `(uint256 value, uint64 updatedAt)`, freshness, and immutable maximum age in seconds |
 | SwarmFeed, PriceFeed, NhiFeed | `attester()`, `relayer()`, `attestationChainId()`, `attestationAnswerType()`, `reporter0()`, `reporter1()`, `reporter2()`, `quorum()`, `maxDeviationBps()` | Immutable attestation and reporter configuration |
 | SwarmFeed, PriceFeed, NhiFeed | `ATTESTATION_TYPEHASH()`, `DOMAIN_SEPARATOR()` | EIP-712 type hash and immutable consumer domain |
+| SwarmFeed, PriceFeed, NhiFeed | `MIN_PANEL_SIZE()`, `MIN_AGREED()` | Signed panel floors: 25 members and 15 agreeing members |
 | SwarmFeed, PriceFeed, NhiFeed | `round()`, `reportCount()`, `lastReportedRound(account)`, `usedRequests(requestId)`, `isReporter(account)` | Fallback round, replay, and reporter views |
 | SwarmFeed, PriceFeed, NhiFeed | `submitAttestation(attestation, signature)` | Configured relayer, or anyone when zero, submits a fresh attestation signed by `attester()` with matching payload chain and answer type |
 | SwarmFeed, PriceFeed, NhiFeed | `report(value)` | Allowlisted reporter submits one value per round; quorum publishes the median |
@@ -34,12 +35,13 @@ The JSON files in `docs/abi/` contain complete Solidity ABI arrays, including co
 | CDPVault | `totalDebt()`, `debtCeiling()`, `protocolBonusShareBps()` | Outstanding borrowed principal and the unchanged issuance-cap and protocol-bonus hooks |
 | CDPVault | `totalFeesMinted()` | Cumulative paid fees minted to FEE_RECIPIENT |
 | CDPVault | `badDebtOf(account)` | Current debt not coverable by the existing 110% payout, including accrued fees and payout rounding |
-| CDPVault | `totalBadDebt()`, `recordedBadDebtOf(account)` | Outstanding recognized shortfall, checkpointed after collateral-exhausting liquidations and debt changes |
+| CDPVault | `totalBadDebt()`, `recordedBadDebtOf(account)` | Outstanding recognized shortfall, checkpointed after liquidations exhaust usable collateral (including unseizable dust) and debt changes |
 | CDPVault | `depositCollateral(amount)` | Moves caller's approved IMD into their position |
 | CDPVault | `withdrawCollateral(amount)` | Returns caller's IMD if debt is zero or the remaining position meets `minCR()` |
 | CDPVault | `mintCOMP(amount)` | Increases caller's debt and mints COMP if the resulting position meets `minCR()`; consumes no work rights |
 | CDPVault | `mintFromWork(amount)` | Consumes caller's work rights and mints COMP without collateral or debt |
 | CDPVault | `repayCOMP(amount)` | Burns caller's COMP, decreases their debt; no approval and no rights refund |
+| CDPVault | `repayAllCOMP()` | Burns caller's entire debt at execution time, including accrued fees; requires enough COMP, no approval or fresh feeds |
 | CDPVault | `markUnderwater(owner)` | Anyone may mark an unhealthy position and snapshot its grace period |
 | CDPVault | `clearRecoveredMark(owner)` | Anyone may clear a healthy position's mark |
 | CDPVault | `liquidate(owner, debtToRepay)` | Burns caller's COMP against accrued debt after the marked position's grace; splits the IMD bonus between liquidator, marker and protocol |
@@ -58,7 +60,9 @@ Deferred CompToken initialization and mock faucet authority is the explicit work
 
 Feed values use 18 decimals. Before the first update, `latestValue()` returns `(0, 0)` and `isStale()` is true. A value is stale only when its age is greater than maxAge, so the exact age boundary is still fresh. Zero updates revert. While the previous value is fresh, each submitted report and accepted update must differ by at most `floor(previousValue * maxDeviationBps / 10000)`; once stale, the next update may re-anchor at any positive value. Reaching reporter quorum publishes the median (the floored mean for quorum two), dated at the oldest contributing report. An unfinished round expires after maxAge. A quorum-one reporter can complete multiple rounds in the same block; the deviation bound is per update, not per unit of time.
 
-`submitAttestation` takes an `OracleAttestation` tuple in this exact order: `(bytes32 requestId, uint256 chainId, bytes32 questionHash, uint8 answerType, bytes answer, uint256 figure, uint64 fromBlock, uint64 toBlock, bytes32 blockHash, bytes32 panelJobId, uint64 issuedAt, uint64 expiresAt)`, followed by a 65-byte signature. The EIP-712 domain is `IdentityMD Oracle`, version `1`, with the deployment chain ID and the receiving feed's address, computed once in its constructor. Payload chainId and answerType must equal `attestationChainId()` and `attestationAnswerType()`; the payload data chain may differ from the consumer chain (for example, mainnet data consumed on Sepolia). requestId is consumed once per feed; issuedAt cannot be in the future, exceed expiresAt, precede the last accepted update, or be older than maxAge. Delivery after expiresAt is rejected. The feed publishes figure and uses signed issuedAt for freshness, then discards any unfinished reporter round.
+`submitAttestation` takes an `OracleAttestation` tuple in this exact order: `(bytes32 requestId, uint256 chainId, bytes32 questionHash, uint8 answerType, bytes answer, uint256 figure, uint64 fromBlock, uint64 toBlock, bytes32 blockHash, bytes32 panelJobId, uint16 panelSize, uint16 quorum, uint16 agreed, uint64 issuedAt, uint64 expiresAt)`, followed by a 65-byte signature. The EIP-712 domain is `IdentityMD Oracle`, version `2`, with the deployment chain ID and the receiving feed's address, computed once in its constructor. The signed panel must have at least `MIN_PANEL_SIZE()` (25) members; `agreed` must be at least `MIN_AGREED()` (15) and no greater than `panelSize`. The signed `quorum` is included in the type hash but does not replace these consumer floors or the separate reporter quorum. Payload chainId and answerType must equal `attestationChainId()` and `attestationAnswerType()`; the payload data chain may differ from the consumer chain (for example, mainnet data consumed on Sepolia). requestId is consumed once per feed; issuedAt cannot be in the future, exceed expiresAt, precede the last accepted update, or be older than maxAge. Delivery after expiresAt is rejected. The feed publishes figure and uses signed issuedAt for freshness, then discards any unfinished reporter round.
+
+The v2 selector is `0x383f5938`. The old twelve-field selector `0xcb2c90fe` has no matching function. `oracle/relay-attestation.js` still encodes the old tuple and must not be used for these feeds until its ABI and tuple include `panelSize`, `quorum`, and `agreed` after `panelJobId`. Its preflight must also account for the panel floors. That file is outside this assignment's permitted paths; the generated feed ABIs and the tuple above describe the current interface.
 
 The signed questionHash binds a changing pinned block window and is emitted with each accepted attestation; there is no immutable questionHash gate or getter. The contract cannot verify which question was answered. Once seeded and while the last value is fresh, the deviation guard bounds a wrong-question figure. A nonzero relayer covers the unseeded first value and stale re-anchors. The consumer domain prevents cross-feed replay but does not identify the question; a stable per-question identifier would remove the need for a relayer entirely.
 
@@ -81,25 +85,30 @@ Events:
 
 Custom errors have no arguments unless indicated in the generated ABI. `Unauthorized` indicates a caller outside the permitted authority; `AlreadyInitialized` indicates permanently closed CompToken setup. Invalid contract addresses, and targets that fail the reciprocal-link checks, produce `InvalidToken`, `InvalidVault`, `InvalidOracle`, or `InvalidFeed`. A failed `setVault` does not consume initialization authority. `NotInitialized` means CompToken has not authorized this vault. MockWorkOracle additionally uses `InvalidAccount` for zero recipients, `ZeroAmount`, and `InsufficientRights`.
 
-Feed errors are `InvalidConfiguration`, `UnauthorizedReporter`, `UnauthorizedRelayer`, `InvalidAttestationChain`, `InvalidAnswerType`, `AlreadyReported`, `ZeroValue`, `ExcessDeviation`, `InvalidSignature`, `InvalidTimestamp`, `ExpiredAttestation`, `StaleAttestation`, and `ReplayedAttestation`. InvalidSignature includes malformed length, high-s signatures, invalid v, and a signer other than the configured attester. Relayer, payload-chain and answer-type policy failures revert before consuming the request or updating the feed.
+Feed errors are `InvalidConfiguration`, `UnauthorizedReporter`, `UnauthorizedRelayer`, `InvalidAttestationChain`, `InvalidAnswerType`, `AlreadyReported`, `ZeroValue`, `ExcessDeviation`, `InvalidSignature`, `InvalidTimestamp`, `ExpiredAttestation`, `StaleAttestation`, `ReplayedAttestation`, `PanelTooSmall`, and `NotEnoughAgreement`. InvalidSignature includes malformed length, high-s signatures, invalid v, and a signer other than the configured attester. Relayer, payload-chain, panel-floor and answer-type policy failures revert before consuming the request or updating the feed.
 
 Vault operation errors are `ZeroAmount`, `InsufficientCollateral`, `InsufficientRights`, `UnsafeCollateralRatio`, `HealthyPosition`, `ExcessRepayment`, `UnexpectedCollateralReceived`, `StaleFeed`, `InvalidPrice`, `PositionNotMarked`, `GracePeriodNotElapsed`, `MarkExpired`, `UnderwaterPosition`, `DebtCeilingReached`, `PriceDivergence`, and `InvalidBasisPoints`. UnexpectedCollateralReceived detects an unsupported collateral deposit whose balance increase differs from the requested amount. External token/oracle/feed reverts propagate; ERC-20 custom errors include balances and allowances. SafeERC20 false returns produce `SafeERC20FailedOperation(token)`. Reentry produces `ReentrancyGuardReentrantCall`. A reverted transaction rolls back position changes, work credits, token supply, and emitted events together.
 
-Suggested frontend sequence: approve the desired IMD deposit, deposit, check feed freshness and collateral headroom against `minCR()`, then borrow with `mintCOMP`. Work minting uses `mintFromWork` and available rights independently of collateral. On repayment, call repay directly from the indebted wallet and withdraw any newly available collateral. Show debt-free ratios as debt-free rather than rendering uint256.max as a percentage. Display price, NHI, the effective minimum ratio, and the stored grace countdown and mark expiry. Refresh balances, rights, feeds, and position after each confirmed transaction. Restrict the grant-rights panel to `MockWorkOracle.deployer()` and show Sepolia only.
+Suggested frontend sequence: approve the desired IMD deposit, deposit, check feed freshness and collateral headroom against `minCR()`, then borrow with `mintCOMP`. Work minting uses `mintFromWork` and available rights independently of collateral. For partial repayment, call `repayCOMP(amount)` from the indebted wallet. For a full close, fund the wallet for the debt including fees through execution and use `repayAllCOMP()` before withdrawing collateral. A prior `debtOf` quote can leave residual debt when used with `repayCOMP`; overpayment still reverts `ExcessRepayment`. Repay-all on a debt-free position reverts `ZeroAmount`. Show debt-free ratios as debt-free rather than rendering uint256.max as a percentage. Display price, NHI, the effective minimum ratio, and the stored grace countdown and mark expiry. Refresh balances, rights, feeds, and position after each confirmed transaction. Restrict the grant-rights panel to `MockWorkOracle.deployer()` and show Sepolia only.
 
-To regenerate every committed ABI export from the repository root, build sources explicitly. The unchanged `tools/export_abi.py` lists only the original six contracts; this uses its JSON formatting for all current exports. The CDPVault constructor and liquidation mark tuple changed in this increment; consumers must use the regenerated CDPVault ABI. Isolate the build from the unchanged legacy test and script constructor calls:
+To check every committed ABI export against the whole-tree build, run the following from the repository root. The unchanged `tools/export_abi.py` lists only six contracts, so its `--check` cannot detect stale feed exports; that file is outside this assignment's permitted paths. The check below includes every file in `docs/abi`. To regenerate instead, omit `--check` from the Python command. Consumers must use the current CDPVault ABI, including `repayAllCOMP`, the nine constructor arguments and the four-field liquidation mark.
 
 ```sh
-FOUNDRY_TEST=test/scratch/empty-script FOUNDRY_SCRIPT=test/scratch/empty-script \
-forge build --offline --out test/scratch/abi-out --cache-path test/scratch/abi-cache
-python3 - <<'PY'
+forge build --offline
+python3 - --check <<'PY'
 import json
 from pathlib import Path
+import sys
 
 for destination in sorted(Path("docs/abi").glob("*.json")):
     name = destination.stem
-    artifact = Path("test/scratch/abi-out") / f"{name}.sol" / f"{name}.json"
+    artifact = Path("out") / f"{name}.sol" / f"{name}.json"
     abi = json.loads(artifact.read_text())["abi"]
-    destination.write_text(json.dumps(abi, indent=2) + "\n")
+    rendered = json.dumps(abi, indent=2) + "\n"
+    if "--check" in sys.argv:
+        assert destination.read_text() == rendered, f"Stale ABI: {destination}"
+    else:
+        destination.write_text(rendered)
+    print(destination)
 PY
 ```

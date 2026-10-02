@@ -97,7 +97,7 @@ contract CDPVault is ReentrancyGuard {
     uint256 public immutable deployedAt;
     uint256 public totalFeesMinted;
 
-    /// @notice Outstanding shortfalls recognized when liquidation exhausts collateral.
+    /// @notice Outstanding shortfalls recognized when liquidation exhausts usable collateral.
     /// @dev Checkpointed on debt changes, not a live sum of badDebtOf. Only repayment reduces a
     /// recognized shortfall; depositing collateral cannot hide it. There is no insurance or debt forgiveness.
     uint256 public totalBadDebt;
@@ -226,6 +226,16 @@ contract CDPVault is ReentrancyGuard {
     /// @notice Repay the caller's debt by burning their COMP; no COMP approval is required.
     /// @dev Repayment does not restore consumed work credits.
     function repayCOMP(uint256 amount) external nonReentrant {
+        _repayCOMP(amount);
+    }
+
+    /// @notice Repay all caller debt, including fees accrued through the executing block.
+    /// @dev Requires enough COMP for the live debt; no feed check or COMP approval is required.
+    function repayAllCOMP() external nonReentrant {
+        _repayCOMP(debtOf(msg.sender));
+    }
+
+    function _repayCOMP(uint256 amount) private {
         if (amount == 0) revert ZeroAmount();
         _accrue(msg.sender);
         uint256 feePaid = _reduceDebt(msg.sender, amount);
@@ -295,7 +305,11 @@ contract CDPVault is ReentrancyGuard {
         address marker = mark.marker;
         uint256 feePaid = _reduceDebt(owner, debtToRepay);
         position.collateral -= collateralSeized;
-        if (position.collateral == 0) _recordBadDebt(owner, debtOf(owner));
+        // Match the floor-rounded payout above: dust below a one-wei repayment's payout
+        // cannot cover any further liquidation. Keep the dust and recognize the unpaid debt.
+        if (position.collateral == 0 || position.collateral < (100 + LIQUIDATION_BONUS_PERCENT) * 1e16 / price) {
+            _recordBadDebt(owner, debtOf(owner));
+        }
         _clearIfRecovered(owner);
         _burnRepayment(owner, msg.sender, debtToRepay, feePaid);
         if (marker == msg.sender) {
