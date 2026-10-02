@@ -256,7 +256,8 @@ contract CDPVault is ReentrancyGuard {
     /// when recovery is observed; deposit, repayment and successful borrowing/withdrawal also clear them.
     /// Borrowers should call this while healthy: an unobserved recovery does not restart grace within
     /// the bounded mark lifetime, even if a subsequent dip happens before that lifetime ends.
-    /// Recovery is judged at the primary price, so a disputed price cannot be used to discard a live mark.
+    /// Recovery is judged at the primary price, so a disputed price cannot be used to discard a live mark;
+    /// the incidental clearing inside deposit and repayment applies the same bound without reverting.
     function clearRecoveredMark(address owner) external nonReentrant {
         _requireFreshFeeds();
         _requirePriceAgreement();
@@ -480,6 +481,10 @@ contract CDPVault is ReentrancyGuard {
         return debt == 0 || _collateralRatio(collateral, debt, _price()) >= minCR();
     }
 
+    /// @dev Incidental clearing on deposit, repayment and liquidation. The debt-free branch is unconditional.
+    /// The healthy-at-primary branch is the same decision clearRecoveredMark takes, so it skips (never reverts)
+    /// while spot disputes the primary: a pushed average must not discard a live mark through a one-wei deposit
+    /// or repayment either. The deposit or repayment itself still succeeds.
     function _clearIfRecovered(address owner) private {
         if (!liquidationMarks[owner].marked) return;
         Position storage position = _positions[owner];
@@ -488,10 +493,19 @@ contract CDPVault is ReentrancyGuard {
             _clearMark(owner);
         } else if (!priceFeed.isStale() && !nhiFeed.isStale()) {
             (uint256 price,) = priceFeed.latestValue();
-            if (price != 0 && _collateralRatio(position.collateral, debt, price) >= minCR()) {
+            if (price != 0 && _spotAgrees(price) && _collateralRatio(position.collateral, debt, price) >= minCR()) {
                 _clearMark(owner);
             }
         }
+    }
+
+    /// @dev Non-reverting form of _requirePriceAgreement for paths that must succeed regardless of spot.
+    function _spotAgrees(uint256 price) private view returns (bool) {
+        if (spotFeed.isStale()) return false;
+        (uint256 spot,) = spotFeed.latestValue();
+        if (spot == 0) return false;
+        uint256 difference = spot > price ? spot - price : price - spot;
+        return difference <= Math.mulDiv(price, maxDivergenceBps, 10_000);
     }
 
     function _expired(LiquidationMark storage mark) private view returns (bool) {

@@ -190,6 +190,44 @@ contract CDPVaultIncrementTest is Test {
         assertEq(vault.debtOf(ALICE), 100 ether);
     }
 
+    function test_depositAndRepaymentDoNotClearMarkWhileSpotDisputesPrimary() public {
+        _deploy(1000, 0, 0, type(uint256).max);
+        _open(ALICE, 150 ether, 100 ether);
+        _price(0.9 ether);
+        _mark();
+        primary.setValue(1 ether); // 10% apart: clearRecoveredMark refuses, and so must the incidental clears
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vault.clearRecoveredMark(ALICE);
+        vm.startPrank(ALICE);
+        vault.depositCollateral(1);
+        vault.repayCOMP(1);
+        vm.stopPrank();
+        (,, bool marked, address marker) = vault.liquidationMarks(ALICE);
+        assertTrue(marked, "mark survives disputed deposit and repayment");
+        assertEq(marker, MARKER, "marker claim survives");
+        spot.setStale(true);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        (,, marked,) = vault.liquidationMarks(ALICE);
+        assertTrue(marked, "stale spot cannot clear either");
+        spot.setStale(false);
+        spot.setValue(1 ether);
+        vm.prank(ALICE);
+        vault.depositCollateral(1);
+        (,, marked, marker) = vault.liquidationMarks(ALICE);
+        assertFalse(marked, "agreed recovery clears as before");
+        assertEq(marker, address(0));
+        // Debt-free clearing stays unconditional.
+        _price(0.9 ether);
+        _mark();
+        primary.setValue(1 ether);
+        uint256 remaining = vault.debtOf(ALICE);
+        vm.prank(ALICE);
+        vault.repayCOMP(remaining);
+        (,, marked,) = vault.liquidationMarks(ALICE);
+        assertFalse(marked, "repaying to zero clears regardless of spot");
+    }
+
     function test_zeroAndStaleSpotBlockOnlyGuardedActions() public {
         _open(ALICE, 150 ether, 100 ether);
         nhi.setValue(0.6 ether);
