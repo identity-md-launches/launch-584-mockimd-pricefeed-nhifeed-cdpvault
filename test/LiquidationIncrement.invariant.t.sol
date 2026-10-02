@@ -156,10 +156,15 @@ contract IncrementHandler is Test {
             if (diverged) ++divergentExits;
             return;
         }
+        // A withdrawal against open debt is price-dependent: the divergence guard comes first, and only
+        // an agreeing spot lets the health check decide.
+        bytes4 guard = _guardError();
         vm.prank(actor);
-        try vault.withdrawCollateral(amount) {}
-        catch (bytes memory reason) {
-            assertEq(bytes4(reason), CDPVault.UnsafeCollateralRatio.selector, "unexpected withdrawal error");
+        try vault.withdrawCollateral(amount) {
+            assertEq(guard, bytes4(0), "debt-bearing withdrawal passed a failing guard");
+        } catch (bytes memory reason) {
+            _expectGuardOr(reason, guard, CDPVault.UnsafeCollateralRatio.selector);
+            if (guard != bytes4(0)) ++guardedRejections;
         }
     }
 
@@ -255,10 +260,21 @@ contract IncrementHandler is Test {
 
     function clearMark(uint256 seed, uint256 ownerSeed) external {
         address owner = borrowers[ownerSeed % borrowers.length];
+        // Recovery is judged at the primary price, so a disputed primary cannot discard a live mark:
+        // the divergence guard comes before the health check here as well.
+        bytes4 guard = _guardError();
+        (,, bool markedBefore,) = vault.liquidationMarks(owner);
         vm.prank(keepers[seed % keepers.length]);
-        try vault.clearRecoveredMark(owner) {}
-        catch (bytes memory reason) {
-            assertEq(bytes4(reason), CDPVault.UnderwaterPosition.selector, "unexpected clear error");
+        try vault.clearRecoveredMark(owner) {
+            assertEq(guard, bytes4(0), "clear passed a failing guard");
+            (,, bool marked, address marker) = vault.liquidationMarks(owner);
+            assertFalse(marked, "a successful clear leaves no mark");
+            assertEq(marker, address(0), "a successful clear leaves no marker");
+        } catch (bytes memory reason) {
+            _expectGuardOr(reason, guard, CDPVault.UnderwaterPosition.selector);
+            (,, bool marked,) = vault.liquidationMarks(owner);
+            assertEq(marked, markedBefore, "a rejected clear leaves the mark as it was");
+            if (guard != bytes4(0)) ++guardedRejections;
         }
     }
 
@@ -380,7 +396,8 @@ contract IncrementHandler is Test {
     // Helpers
     // ------------------------------------------------------------------------------------------------
 
-    /// @dev Mirrors _requirePriceAgreement: the error the three guarded entry points must surface.
+    /// @dev Mirrors _requirePriceAgreement: the error every price-dependent entry point (mint, mark,
+    /// liquidate, clear and a debt-bearing withdrawal) must surface before any other check.
     function _guardError() private view returns (bytes4) {
         if (spot.isStale()) return CDPVault.StaleFeed.selector;
         (uint256 spotPrice,) = spot.latestValue();

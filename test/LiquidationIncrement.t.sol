@@ -231,6 +231,120 @@ contract LiquidationIncrementTest is Test {
         assertEq(collateral, 139 ether, "payout still prices off the primary, not the spot");
     }
 
+    function test_debtBearingWithdrawalIsGuardedAtTheSameBoundaryAndDebtFreeExitIsNot() public {
+        _open(ALICE, 300 ether, 100 ether);
+        uint256 tolerance = Math.mulDiv(1 ether, vault.maxDivergenceBps(), 10_000);
+
+        // Exactly at the bound in both directions the health check decides, and the remainder is healthy.
+        spot.setValue(1 ether + tolerance);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(1 ether);
+        spot.setValue(1 ether - tolerance);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(1 ether);
+        (uint256 collateral,) = vault.positions(ALICE);
+        assertEq(collateral, 298 ether);
+
+        // One wei beyond, stale or zero: the guard refuses before the health check even runs.
+        spot.setValue(1 ether + tolerance + 1);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(1 ether);
+        spot.setValue(1 ether - tolerance - 1);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(1 ether);
+        spot.setStale(true);
+        vm.expectRevert(CDPVault.StaleFeed.selector);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(1 ether);
+        spot.setStale(false);
+        spot.setValue(0);
+        vm.expectRevert(CDPVault.InvalidPrice.selector);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(1 ether);
+        (collateral,) = vault.positions(ALICE);
+        assertEq(collateral, 298 ether, "rejected withdrawals release nothing");
+
+        // The attack the guard exists for: a pushed primary says 98 IMD at 2 COMP covers 100 COMP at
+        // CR 196, but the spot still says 1, so no collateral leaves against the open debt.
+        spot.setValue(1 ether);
+        primary.setValue(2 ether);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(200 ether);
+        primary.setValue(1 ether);
+        vm.expectRevert(CDPVault.UnsafeCollateralRatio.selector);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(200 ether);
+        (collateral,) = vault.positions(ALICE);
+        assertEq(collateral, 298 ether);
+
+        // Once the debt is gone the spot is irrelevant: repay while diverged, exit while stale.
+        spot.setValue(100 ether);
+        vm.prank(ALICE);
+        vault.repayCOMP(100 ether);
+        spot.setStale(true);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(298 ether);
+        (collateral,) = vault.positions(ALICE);
+        assertEq(collateral, 0, "debt-free exit ignores the spot entirely");
+    }
+
+    function test_clearRecoveredMarkRefusesADisputedPriceAndKeepsTheMark() public {
+        _open(ALICE, 150 ether, 100 ether);
+        _price(0.9 ether); // CR 135 < 150: underwater at an honest price
+        _mark(KEEPER, ALICE);
+        (uint256 markedAt, uint256 grace, bool marked, address marker) = vault.liquidationMarks(ALICE);
+        assertTrue(marked);
+        uint256 tolerance = Math.mulDiv(0.9 ether, vault.maxDivergenceBps(), 10_000);
+
+        // A pushed primary alone would make ALICE healthy (CR 150) but the spot disagrees.
+        primary.setValue(1 ether);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(ALICE);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(ALICE);
+        vault.clearRecoveredMark(ALICE);
+        primary.setValue(0.9 ether);
+
+        // Stale and zero spot are refused the same way, whatever the primary says.
+        spot.setStale(true);
+        vm.expectRevert(CDPVault.StaleFeed.selector);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(ALICE);
+        spot.setStale(false);
+        spot.setValue(0);
+        vm.expectRevert(CDPVault.InvalidPrice.selector);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(ALICE);
+
+        // Exactly at the bound the guard passes and the health check, at the primary, still says underwater.
+        spot.setValue(0.9 ether + tolerance);
+        vm.expectRevert(CDPVault.UnderwaterPosition.selector);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(ALICE);
+        spot.setValue(0.9 ether + tolerance + 1);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(ALICE);
+
+        (uint256 stillAt, uint256 stillGrace, bool stillMarked, address stillMarker) = vault.liquidationMarks(ALICE);
+        assertTrue(stillMarked, "every rejected clear leaves the mark live");
+        assertEq(stillAt, markedAt);
+        assertEq(stillGrace, grace);
+        assertEq(stillMarker, marker, "the marker keeps its claim on the bonus");
+
+        // An honest recovery, both feeds agreeing, clears it.
+        _price(1 ether);
+        vm.prank(KEEPER);
+        vault.clearRecoveredMark(ALICE);
+        (,, marked, marker) = vault.liquidationMarks(ALICE);
+        assertFalse(marked);
+        assertEq(marker, address(0));
+    }
+
     function test_staleOrZeroSpotBlocksGuardedActionsOnly() public {
         _open(ALICE, 300 ether, 100 ether);
         _work(BOB, 100 ether);
