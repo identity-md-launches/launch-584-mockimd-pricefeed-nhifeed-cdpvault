@@ -174,10 +174,14 @@ contract CDPVault is ReentrancyGuard {
         Position storage position = _positions[msg.sender];
         if (amount > position.collateral) revert InsufficientCollateral();
         uint256 remaining = position.collateral - amount;
-        // A withdrawal with debt always lowers CR, so it cannot be allowed with stale feeds.
-        // Debt-free collateral remains withdrawable: its ratio is infinite and no solvency depends on a feed.
+        // A withdrawal with debt always lowers CR, so it cannot be allowed with stale feeds, and it is
+        // permitted only because the primary price says the remainder is healthy, so it must also refuse
+        // while spot contradicts that price: a pushed average would otherwise let collateral out against
+        // open debt. Debt-free collateral remains withdrawable: its ratio is infinite and no solvency
+        // depends on a feed.
         if (position.debt != 0) {
             _requireFreshFeeds();
+            _requirePriceAgreement();
             if (!_healthy(remaining, debtOf(msg.sender))) revert UnsafeCollateralRatio();
         }
         position.collateral = remaining;
@@ -252,8 +256,10 @@ contract CDPVault is ReentrancyGuard {
     /// when recovery is observed; deposit, repayment and successful borrowing/withdrawal also clear them.
     /// Borrowers should call this while healthy: an unobserved recovery does not restart grace within
     /// the bounded mark lifetime, even if a subsequent dip happens before that lifetime ends.
+    /// Recovery is judged at the primary price, so a disputed price cannot be used to discard a live mark.
     function clearRecoveredMark(address owner) external nonReentrant {
         _requireFreshFeeds();
+        _requirePriceAgreement();
         Position storage position = _positions[owner];
         if (!_healthy(position.collateral, debtOf(owner))) revert UnderwaterPosition();
         _clearMark(owner);
@@ -389,7 +395,8 @@ contract CDPVault is ReentrancyGuard {
 
     /// @dev A pinned closing block and an attestation valid for its TTL let an attacker know which
     /// block to push and act on the signature afterwards. Price off the primary window average;
-    /// spot is only a disagreement bound, never a replacement price or a repayment/exit gate.
+    /// spot is only a disagreement bound on every price-dependent action, never a replacement price,
+    /// and never a gate on repayment or a debt-free withdrawal.
     function _requirePriceAgreement() private view {
         if (spotFeed.isStale()) revert StaleFeed();
         (uint256 spot,) = spotFeed.latestValue();

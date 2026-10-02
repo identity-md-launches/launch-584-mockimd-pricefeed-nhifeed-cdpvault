@@ -182,6 +182,11 @@ contract CDPVaultIncrementTest is Test {
         vm.expectRevert();
         vm.prank(BOB);
         vault.liquidate(ALICE, 10 ether);
+        // A pushed primary the spot contradicts cannot be used to discard the live mark either.
+        primary.setValue(2 ether);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
+        vault.clearRecoveredMark(ALICE);
+        primary.setValue(1 ether);
         assertEq(vault.debtOf(ALICE), 100 ether);
     }
 
@@ -217,11 +222,17 @@ contract CDPVaultIncrementTest is Test {
         _assertSupply();
     }
 
-    function test_debtBearingWithdrawalRetainsExistingGuard() public {
+    function test_debtBearingWithdrawalIsPriceDependentAndGuarded() public {
         _open(ALICE, 300 ether, 100 ether);
+        // A debt-bearing withdrawal is allowed only because the primary says the remainder is healthy,
+        // so a primary the spot contradicts must not release collateral against open debt.
         spot.setValue(100 ether);
+        vm.expectRevert(CDPVault.PriceDivergence.selector);
         vm.prank(ALICE);
-        vault.withdrawCollateral(1 ether); // Spot is deliberately not an additional withdrawal guard.
+        vault.withdrawCollateral(1 ether);
+        spot.setValue(1 ether);
+        vm.prank(ALICE);
+        vault.withdrawCollateral(1 ether);
         primary.setStale(true);
         vm.expectRevert(CDPVault.StaleFeed.selector);
         vm.prank(ALICE);

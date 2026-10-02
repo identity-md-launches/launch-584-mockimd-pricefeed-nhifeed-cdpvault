@@ -21,13 +21,13 @@ Each basis-point argument is bounded by 10,000. Spot must have code and cannot b
 
 ## Price and marker behavior
 
-`mintCOMP`, `markUnderwater` and `liquidate` retain their primary/NHI freshness checks and additionally require a fresh, nonzero spot with:
+`mintCOMP`, `markUnderwater`, `liquidate`, a debt-bearing `withdrawCollateral` and `clearRecoveredMark` retain their primary/NHI freshness checks and additionally require a fresh, nonzero spot with:
 
 ```text
 abs(primary - spot) <= floor(primary * maxDivergenceBps / 10000)
 ```
 
-The accepted boundary is inclusive. Health and payout always use the primary. Repayment and debt-free withdrawal do not consult the divergence bound. Existing guards for work minting, debt-bearing withdrawal, deposits and mark recovery retain their scope. A pinned closing block and an attestation valid for its TTL expose both a known manipulation target and a later execution opportunity; the primary average is therefore the pricing input and spot is only a disagreement detector. This change does not implement averaging inside a feed.
+The accepted boundary is inclusive. Health and payout always use the primary. Repayment and debt-free withdrawal do not consult the divergence bound. A withdrawal with open debt does: it is permitted only because the primary says the remainder is healthy, so a pushed primary that spot contradicts must not release collateral against debt (the revision finding reproduced this with a primary of 2 against a spot of 1 letting a position at the minimum CR withdraw half its collateral). Clearing a recovered mark is judged at the same price and is guarded for the same reason. Existing guards for work minting and deposits retain their scope. A pinned closing block and an attestation valid for its TTL expose both a known manipulation target and a later execution opportunity; the primary average is therefore the pricing input and spot is only a disagreement detector. This change does not implement averaging inside a feed.
 
 An active mark preserves both its marker and grace snapshot. A cleared or expired mark can be replaced. On liquidation, compute the original collateral seizure and principal payout, then split only their difference:
 
