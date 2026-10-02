@@ -15,7 +15,9 @@ contract ArithmeticTest is ProtocolFixture {
         comp = new CompToken(address(0));
         priceFeed = new TestSwarmFeed(1 ether);
         nhiFeed = new TestSwarmFeed(0.85 ether);
-        vault = new CDPVault(address(imd), address(comp), address(0), address(priceFeed), address(nhiFeed));
+        vault = new CDPVault(
+            address(imd), address(comp), address(0), address(priceFeed), address(nhiFeed), address(priceFeed), 0, 0, 0
+        );
         oracle = MockWorkOracle(address(vault.oracle()));
         vm.startPrank(OPERATOR);
         comp.setVault(address(vault));

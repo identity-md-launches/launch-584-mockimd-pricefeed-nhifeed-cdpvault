@@ -17,9 +17,11 @@ contract ApplicationConstructionFactory {
         returns (CDPVault vault)
     {
         if (useCreate2) {
-            vault = new CDPVault{salt: bytes32(uint256(1))}(imd, comp, address(0), priceFeed, nhiFeed);
+            vault = new CDPVault{salt: bytes32(uint256(1))}(
+                imd, comp, address(0), priceFeed, nhiFeed, priceFeed, 0, 0, 0
+            );
         } else {
-            vault = new CDPVault(imd, comp, address(0), priceFeed, nhiFeed);
+            vault = new CDPVault(imd, comp, address(0), priceFeed, nhiFeed, priceFeed, 0, 0, 0);
         }
     }
 }
@@ -180,7 +182,17 @@ contract SelfContainedFactoryDeploymentTest is Test {
         bytes32 initCodeHash = keccak256(
             abi.encodePacked(
                 type(CDPVault).creationCode,
-                abi.encode(address(imd), address(0), address(0), address(priceFeed), address(nhiFeed))
+                abi.encode(
+                    address(imd),
+                    address(0),
+                    address(0),
+                    address(priceFeed),
+                    address(nhiFeed),
+                    address(priceFeed),
+                    0,
+                    0,
+                    0
+                )
             )
         );
         address predicted = vm.computeCreate2Address(bytes32(uint256(1)), initCodeHash, address(factory));

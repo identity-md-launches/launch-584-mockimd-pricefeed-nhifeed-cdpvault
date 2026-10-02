@@ -37,7 +37,14 @@ contract DeployComp is Script {
     // therefore ask for a low quorum — so that it attests at all — while the feed still refuses
     // anything under these. The dev's own example is panelSize >= 5 && agreed >= 4.
     uint16 constant MIN_PANEL_SIZE = 25; // mirrors SwarmFeed.MIN_PANEL_SIZE
-    uint16 constant MIN_AGREED = 15;     // mirrors SwarmFeed.MIN_AGREED
+    uint16 constant MIN_AGREED = 15; // mirrors SwarmFeed.MIN_AGREED
+
+    // Vault words for this increment. The spot feed is a third SwarmFeed with the same words as the
+    // primary; it only bounds disagreement with the primary average. The fee ships inert at zero and
+    // is immutable, so turning it on means a new vault.
+    uint256 constant MAX_DIVERGENCE_BPS = 500;
+    uint256 constant MARKER_SHARE_BPS = 1_000;
+    uint256 constant STABILITY_FEE_BPS = 0;
 
     function run() external {
         address operator = vm.envAddress("OPERATOR");
@@ -56,44 +63,95 @@ contract DeployComp is Script {
         }
 
         PriceFeed priceFeed = new PriceFeed(
-            ATTESTER, operator, ATTESTATION_CHAIN_ID, ANSWER_TYPE_UINT256,
-            operator, address(0), address(0), QUORUM, MAX_AGE, MAX_DEVIATION_BPS
+            ATTESTER,
+            operator,
+            ATTESTATION_CHAIN_ID,
+            ANSWER_TYPE_UINT256,
+            operator,
+            address(0),
+            address(0),
+            QUORUM,
+            MAX_AGE,
+            MAX_DEVIATION_BPS
         );
         NhiFeed nhiFeed = new NhiFeed(
-            ATTESTER, operator, ATTESTATION_CHAIN_ID, ANSWER_TYPE_UINT256,
-            operator, address(0), address(0), QUORUM, MAX_AGE, MAX_DEVIATION_BPS
+            ATTESTER,
+            operator,
+            ATTESTATION_CHAIN_ID,
+            ANSWER_TYPE_UINT256,
+            operator,
+            address(0),
+            address(0),
+            QUORUM,
+            MAX_AGE,
+            MAX_DEVIATION_BPS
+        );
+        PriceFeed spotFeed = new PriceFeed(
+            ATTESTER,
+            operator,
+            ATTESTATION_CHAIN_ID,
+            ANSWER_TYPE_UINT256,
+            operator,
+            address(0),
+            address(0),
+            QUORUM,
+            MAX_AGE,
+            MAX_DEVIATION_BPS
         );
         // compToken_ = 0 and oracle_ = 0 put the vault in self-contained mode: it creates and
         // permanently binds its own CompToken and MockWorkOracle, so no post-deploy call exists.
-        CDPVault vault = new CDPVault(imd, address(0), address(0), address(priceFeed), address(nhiFeed));
+        CDPVault vault = new CDPVault(
+            imd,
+            address(0),
+            address(0),
+            address(priceFeed),
+            address(nhiFeed),
+            address(spotFeed),
+            MAX_DIVERGENCE_BPS,
+            MARKER_SHARE_BPS,
+            STABILITY_FEE_BPS
+        );
 
         vm.stopBroadcast();
 
         console2.log("PriceFeed          ", address(priceFeed));
         console2.log("NhiFeed            ", address(nhiFeed));
+        console2.log("SpotFeed           ", address(spotFeed));
         console2.log("CDPVault           ", address(vault));
         console2.log("CompToken   (inner)", address(vault.compToken()));
         console2.log("MockWorkOracle(in) ", address(vault.oracle()));
 
-        verify(vault, priceFeed, nhiFeed, imd, operator);
+        verify(vault, priceFeed, nhiFeed, spotFeed, imd, operator);
         console2.log("\nAll authority checks passed.");
     }
 
     /// @dev Fails the run if any immutable did not land on us. 519 would have failed this.
-    function verify(CDPVault vault, PriceFeed priceFeed, NhiFeed nhiFeed, address imd, address operator)
-        internal
-        view
-    {
+    function verify(
+        CDPVault vault,
+        PriceFeed priceFeed,
+        NhiFeed nhiFeed,
+        PriceFeed spotFeed,
+        address imd,
+        address operator
+    ) internal view {
         require(address(vault.imdToken()) == imd, "vault: wrong collateral");
         require(address(vault.priceFeed()) == address(priceFeed), "vault: wrong price feed");
         require(address(vault.nhiFeed()) == address(nhiFeed), "vault: wrong nhi feed");
+        require(address(vault.spotFeed()) == address(spotFeed), "vault: wrong spot feed");
         require(address(priceFeed) != address(nhiFeed), "feeds must differ");
+        require(
+            address(spotFeed) != address(priceFeed) && address(spotFeed) != address(nhiFeed),
+            "spot must be its own feed"
+        );
+        require(vault.maxDivergenceBps() == MAX_DIVERGENCE_BPS, "vault: wrong divergence bound");
+        require(vault.markerShareBps() == MARKER_SHARE_BPS, "vault: wrong marker share");
+        require(vault.stabilityFeeBps() == STABILITY_FEE_BPS, "vault: stability fee must ship inert");
 
         CompToken comp = vault.compToken();
         require(comp.vault() == address(vault), "comp: not bound to vault");
         require(comp.totalSupply() == 0, "comp: nonzero opening supply");
 
-        PriceFeed[2] memory feeds = [priceFeed, PriceFeed(address(nhiFeed))];
+        PriceFeed[3] memory feeds = [priceFeed, PriceFeed(address(nhiFeed)), spotFeed];
         for (uint256 i = 0; i < feeds.length; ++i) {
             require(feeds[i].attester() == ATTESTER, "feed: wrong attester");
             require(feeds[i].relayer() == operator, "feed: relayer is not the operator");

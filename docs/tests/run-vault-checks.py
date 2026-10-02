@@ -42,11 +42,14 @@ def adapt(text):
             additions.append((index - 1, arguments[3]))
     for index, price in reversed(additions):
         text = text[:index] + ", " + price + ", 0, 0, 0" + text[index:]
-    text = re.sub(
-        r"\(([^;\n]*?)\)(\s*=\s*vault\.liquidationMarks\()",
-        lambda match: "(" + match[1] + ",)" + match[2],
-        text,
-    )
+    # Only a file that still used the five-word constructor destructures the three-field mark;
+    # a migrated fixture already carries the trailing marker slot and must not get another.
+    if additions:
+        text = re.sub(
+            r"\(([^;\n]*?)\)(\s*=\s*vault\.liquidationMarks\()",
+            lambda match: "(" + match[1] + ",)" + match[2],
+            text,
+        )
     # The factory's CREATE2 prediction hashes the constructor words too.
     text = text.replace(
         "abi.encode(address(imd), address(0), address(0), address(priceFeed), address(nhiFeed))",

@@ -111,7 +111,17 @@ contract AdversarialTest is Test {
         // The immutable oracle validates the address of the vault that will be created next.
         address predictedVault = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         oracle = new AdversarialOracle(CDPVault(predictedVault), alice);
-        vault = new CDPVault(address(collateral), address(comp), address(oracle), address(priceFeed), address(nhiFeed));
+        vault = new CDPVault(
+            address(collateral),
+            address(comp),
+            address(oracle),
+            address(priceFeed),
+            address(nhiFeed),
+            address(priceFeed),
+            0,
+            0,
+            0
+        );
         assertEq(address(vault), predictedVault);
         vm.startPrank(0x5167D014a056E43883e1BBEa5530c3c0dC993281);
         comp.setVault(address(vault));

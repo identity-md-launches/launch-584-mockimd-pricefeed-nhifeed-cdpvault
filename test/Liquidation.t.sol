@@ -20,13 +20,13 @@ contract LiquidationTest is ProtocolFixture {
     function _markAndWait(address owner) internal returns (uint256 markedAt, uint256 grace) {
         vault.markUnderwater(owner);
         bool marked;
-        (markedAt, grace, marked) = vault.liquidationMarks(owner);
+        (markedAt, grace, marked,) = vault.liquidationMarks(owner);
         assertTrue(marked);
         vm.warp(markedAt + grace);
     }
 
     function _assertMark(address owner, uint256 markedAt, uint256 grace, bool marked) internal view {
-        (uint256 actualTime, uint256 actualGrace, bool actualMarked) = vault.liquidationMarks(owner);
+        (uint256 actualTime, uint256 actualGrace, bool actualMarked,) = vault.liquidationMarks(owner);
         assertEq(actualTime, markedAt, "mark timestamp");
         assertEq(actualGrace, grace, "snapshotted grace");
         assertEq(actualMarked, marked, "mark state");
@@ -325,7 +325,7 @@ contract LiquidationTest is ProtocolFixture {
         assertEq(vault.minCR(), 171, "fractional threshold rounds up");
         assertEq(vault.collateralRatio(alice), 170, "collateral value has not changed");
         vault.markUnderwater(alice);
-        (uint256 markedAt,,) = vault.liquidationMarks(alice);
+        (uint256 markedAt,,,) = vault.liquidationMarks(alice);
         _assertMark(alice, markedAt, 12959, true);
 
         vm.warp(markedAt + 1 hours);

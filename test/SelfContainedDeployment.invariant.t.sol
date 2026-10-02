@@ -13,7 +13,7 @@ import {SwarmFeed} from "../src/SwarmFeed.sol";
 
 contract SelfContainedInvariantFactory {
     function deploy(address imd, address price, address nhi) external returns (CDPVault) {
-        return new CDPVault{salt: bytes32(uint256(42))}(imd, address(0), address(0), price, nhi);
+        return new CDPVault{salt: bytes32(uint256(42))}(imd, address(0), address(0), price, nhi, price, 0, 0, 0);
     }
 }
 

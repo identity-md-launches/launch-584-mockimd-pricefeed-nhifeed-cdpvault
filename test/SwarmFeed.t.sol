@@ -367,7 +367,9 @@ abstract contract SwarmFeedTest is Test {
         nhi.report(0.85 ether);
         MockIMD imd = new MockIMD();
         CompToken comp = new CompToken(address(0));
-        CDPVault vault = new CDPVault(address(imd), address(comp), address(0), address(price), address(nhi));
+        CDPVault vault = new CDPVault(
+            address(imd), address(comp), address(0), address(price), address(nhi), address(price), 0, 0, 0
+        );
         vm.startPrank(operator);
         comp.setVault(address(vault));
         imd.mint(REPORTER_A, 140 ether);
@@ -672,8 +674,15 @@ abstract contract SwarmFeedTest is Test {
                     a.figure
                 ),
                 abi.encode(
-                    a.fromBlock, a.toBlock, a.blockHash, a.panelJobId, a.panelSize, a.quorum, a.agreed,
-                    a.issuedAt, a.expiresAt
+                    a.fromBlock,
+                    a.toBlock,
+                    a.blockHash,
+                    a.panelJobId,
+                    a.panelSize,
+                    a.quorum,
+                    a.agreed,
+                    a.issuedAt,
+                    a.expiresAt
                 )
             )
         );

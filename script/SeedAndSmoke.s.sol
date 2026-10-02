@@ -9,19 +9,23 @@ import {CompToken} from "../src/CompToken.sol";
 import {MockIMD} from "../src/MockIMD.sol";
 import {MockWorkOracle} from "../src/MockWorkOracle.sol";
 
-/// @notice Seed both feeds through the reporter path, then drive one full borrow/repay cycle.
+/// @notice Seed all three feeds through the reporter path, then drive one full borrow/repay cycle.
 /// @dev The reporter path is the testnet fallback; the attested path is exercised separately by
 /// RelayAttestation (JS), because the signed struct comes from the control plane.
-/// PRICE is WETH wei per 1e18 raw IMD, the same figure the oracle question asks for.
+/// PRICE is WETH wei per 1e18 raw IMD, the same figure the oracle question asks for. SPOT_PRICE
+/// defaults to PRICE; mintCOMP refuses a spot that diverges from the primary by more than
+/// maxDivergenceBps, so a deliberately different value must stay inside that bound.
 contract SeedAndSmoke is Script {
     function run() external {
         CDPVault vault = CDPVault(vm.envAddress("VAULT"));
         uint256 price = vm.envUint("PRICE"); // e.g. 1292410679962996
+        uint256 spot = vm.envOr("SPOT_PRICE", price);
         uint256 nhi = vm.envOr("NHI", uint256(0.9e18)); // >= 0.85e18 => minCR 150, grace 6h
         address me = vm.envAddress("OPERATOR");
 
         PriceFeed priceFeed = PriceFeed(address(vault.priceFeed()));
         NhiFeed nhiFeed = NhiFeed(address(vault.nhiFeed()));
+        PriceFeed spotFeed = PriceFeed(address(vault.spotFeed()));
         MockIMD imd = MockIMD(address(vault.imdToken()));
         CompToken comp = vault.compToken();
 
@@ -29,8 +33,9 @@ contract SeedAndSmoke is Script {
 
         if (priceFeed.isStale()) priceFeed.report(price);
         if (nhiFeed.isStale()) nhiFeed.report(nhi);
+        if (spotFeed.isStale()) spotFeed.report(spot);
 
-        require(!priceFeed.isStale() && !nhiFeed.isStale(), "feeds still stale after reporting");
+        require(!priceFeed.isStale() && !nhiFeed.isStale() && !spotFeed.isStale(), "feeds still stale after reporting");
         console2.log("minCR now         ", vault.minCR());
         console2.log("gracePeriod now   ", vault.gracePeriod());
 

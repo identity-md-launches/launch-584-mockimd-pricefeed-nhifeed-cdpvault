@@ -18,7 +18,7 @@ contract CappedFeeVault is CDPVault {
     uint256 private immutable _shareBps;
 
     constructor(address imd, uint256 ceiling_, uint256 shareBps_, address priceFeed_, address nhiFeed_)
-        CDPVault(imd, address(0), address(0), priceFeed_, nhiFeed_)
+        CDPVault(imd, address(0), address(0), priceFeed_, nhiFeed_, priceFeed_, 0, 0, 0)
     {
         _ceiling = ceiling_;
         _shareBps = shareBps_;
@@ -47,7 +47,7 @@ contract InHouseTest is Test {
     // used is drained (liquidity() == 0), so its price was a frozen leftover.
     uint256 constant PRICE = 2_219_784_507_040_719;
     uint16 constant MIN_PANEL_SIZE = 25; // mirrors SwarmFeed.MIN_PANEL_SIZE
-    uint16 constant MIN_AGREED = 15;     // mirrors SwarmFeed.MIN_AGREED
+    uint16 constant MIN_AGREED = 15; // mirrors SwarmFeed.MIN_AGREED
 
     PriceFeed priceFeed;
     NhiFeed nhiFeed;
@@ -56,10 +56,21 @@ contract InHouseTest is Test {
     MockIMD imd;
 
     function setUp() public {
+        // Fork-only: without --fork-url the live MockIMD has no code here and the vault constructor
+        // rejects it, so an offline run skips this suite instead of failing before any test runs.
+        if (LIVE_MOCK_IMD.code.length == 0) {
+            vm.skip(true);
+            return;
+        }
         imd = MockIMD(LIVE_MOCK_IMD);
-        priceFeed = new PriceFeed(ATTESTER, OPERATOR, 1, ANSWER_TYPE_UINT256, OPERATOR, address(0), address(0), 1, 86_400, 2_000);
-        nhiFeed = new NhiFeed(ATTESTER, OPERATOR, 1, ANSWER_TYPE_UINT256, OPERATOR, address(0), address(0), 1, 86_400, 2_000);
-        vault = new CDPVault(address(imd), address(0), address(0), address(priceFeed), address(nhiFeed));
+        priceFeed = new PriceFeed(
+            ATTESTER, OPERATOR, 1, ANSWER_TYPE_UINT256, OPERATOR, address(0), address(0), 1, 86_400, 2_000
+        );
+        nhiFeed =
+            new NhiFeed(ATTESTER, OPERATOR, 1, ANSWER_TYPE_UINT256, OPERATOR, address(0), address(0), 1, 86_400, 2_000);
+        vault = new CDPVault(
+            address(imd), address(0), address(0), address(priceFeed), address(nhiFeed), address(priceFeed), 0, 0, 0
+        );
         comp = vault.compToken();
     }
 
@@ -290,18 +301,20 @@ contract InHouseTest is Test {
         f.submitAttestation(a, sig);
     }
 
-    function _sign(PriceFeed f, SwarmFeed.OracleAttestation memory a, uint256 pk)
-        private
-        view
-        returns (bytes memory)
-    {
+    function _sign(PriceFeed f, SwarmFeed.OracleAttestation memory a, uint256 pk) private view returns (bytes memory) {
         // Split and concatenated for the same reason the contract does it: sixteen words in one
         // abi.encode is a stack-too-deep, and every field is a static single-word type.
         bytes32 structHash = keccak256(
             bytes.concat(
                 abi.encode(
-                    f.ATTESTATION_TYPEHASH(), a.requestId, a.chainId, a.questionHash, a.answerType,
-                    keccak256(a.answer), a.figure, a.fromBlock
+                    f.ATTESTATION_TYPEHASH(),
+                    a.requestId,
+                    a.chainId,
+                    a.questionHash,
+                    a.answerType,
+                    keccak256(a.answer),
+                    a.figure,
+                    a.fromBlock
                 ),
                 abi.encode(
                     a.toBlock, a.blockHash, a.panelJobId, a.panelSize, a.quorum, a.agreed, a.issuedAt, a.expiresAt

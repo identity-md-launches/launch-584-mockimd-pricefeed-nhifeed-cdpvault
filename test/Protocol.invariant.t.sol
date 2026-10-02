@@ -44,7 +44,9 @@ contract ProtocolHandler is Test {
         comp = new CompToken(address(0));
         priceFeed = new TestSwarmFeed(1 ether);
         nhiFeed = new TestSwarmFeed(0.85 ether);
-        vault = new CDPVault(address(imd), address(comp), address(0), address(priceFeed), address(nhiFeed));
+        vault = new CDPVault(
+            address(imd), address(comp), address(0), address(priceFeed), address(nhiFeed), address(priceFeed), 0, 0, 0
+        );
         oracle = MockWorkOracle(address(vault.oracle()));
         vm.prank(OPERATOR);
         comp.setVault(address(vault));
@@ -169,7 +171,7 @@ contract ProtocolHandler is Test {
             vault.markUnderwater(actor);
             return;
         }
-        (uint256 timestamp, uint256 grace, bool marked) = vault.liquidationMarks(actor);
+        (uint256 timestamp, uint256 grace, bool marked,) = vault.liquidationMarks(actor);
         if (_healthy(actor)) {
             if (marked) {
                 vault.clearRecoveredMark(actor);
@@ -181,7 +183,7 @@ contract ProtocolHandler is Test {
             return;
         }
         vault.markUnderwater(actor);
-        (uint256 actualTimestamp, uint256 actualGrace, bool actualMarked) = vault.liquidationMarks(actor);
+        (uint256 actualTimestamp, uint256 actualGrace, bool actualMarked,) = vault.liquidationMarks(actor);
         assertTrue(actualMarked);
         if (marked && block.timestamp <= timestamp + grace + vault.liquidationWindow()) {
             assertEq(actualTimestamp, timestamp, "repeat marking preserves timestamp");
@@ -199,7 +201,7 @@ contract ProtocolHandler is Test {
         address owner = actors[ownerSeed % 4];
         address caller = actors[callerSeed % 4];
         if (!_fresh() || _healthy(owner)) return;
-        (uint256 timestamp, uint256 grace, bool marked) = vault.liquidationMarks(owner);
+        (uint256 timestamp, uint256 grace, bool marked,) = vault.liquidationMarks(owner);
         if (
             !marked || block.timestamp < timestamp + grace
                 || block.timestamp > timestamp + grace + vault.liquidationWindow()
@@ -281,7 +283,7 @@ contract ProtocolHandler is Test {
         } else if (_healthy(owner)) {
             expected = CDPVault.HealthyPosition.selector;
         } else {
-            (uint256 timestamp, uint256 grace, bool marked) = vault.liquidationMarks(owner);
+            (uint256 timestamp, uint256 grace, bool marked,) = vault.liquidationMarks(owner);
             if (!marked) {
                 expected = CDPVault.PositionNotMarked.selector;
             } else if (block.timestamp < timestamp + grace) {
@@ -387,7 +389,7 @@ contract ProtocolInvariantTest is StdInvariant, Test {
                     - handler.deposited(actor) - handler.donations(actor),
                 "wallet collateral history"
             );
-            (uint256 timestamp, uint256 grace, bool marked) = vault.liquidationMarks(actor);
+            (uint256 timestamp, uint256 grace, bool marked,) = vault.liquidationMarks(actor);
             if (marked) {
                 assertEq(timestamp, handler.markedAt(actor), "mark timestamp snapshot");
                 assertEq(grace, handler.graceSnapshot(actor), "NHI cannot change in-flight grace");
